@@ -40,6 +40,18 @@ func TestSpansCoverChunksContiguously(t *testing.T) {
 	}
 }
 
+func TestProgressSpeedIsRecent(t *testing.T) {
+	var got Progress
+	now := time.Now()
+	// 100 s of idle history, then 50 MB in the last 6 s.
+	p := &progressReporter{start: now.Add(-100 * time.Second), callback: func(pr Progress) { got = pr }}
+	p.mark, p.prev = now.Add(-6*time.Second), now.Add(-10*time.Second)
+	p.add(50 << 20)
+	if got.BytesPerSecond < 5<<20 {
+		t.Fatalf("speed %d reflects the lifetime average", got.BytesPerSecond)
+	}
+}
+
 // spanServer serves byte ranges of encrypted; serve may misbehave per request.
 func spanServer(t *testing.T, data []byte, serve func(n int, w http.ResponseWriter, body []byte)) (string, []byte, *[]string) {
 	key, encrypted := fixtureFile(data)

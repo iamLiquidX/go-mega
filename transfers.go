@@ -35,20 +35,33 @@ type progressReporter struct {
 	total, transferred int64
 	start              time.Time
 	callback           ProgressFunc
+	// Speed covers the last 5–10 s: bytes since prev, rolled every speedWindow.
+	mark, prev           time.Time
+	markBytes, prevBytes int64
 }
+
+const speedWindow = 5 * time.Second
 
 func (p *progressReporter) add(count int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.transferred += count
-	if p.callback != nil {
-		elapsed := time.Since(p.start).Seconds()
-		speed := int64(0)
-		if elapsed > 0 {
-			speed = int64(float64(p.transferred) / elapsed)
-		}
-		p.callback(Progress{p.name, p.transferred, p.total, speed})
+	if p.callback == nil {
+		return
 	}
+	now := time.Now()
+	if p.mark.IsZero() {
+		p.mark, p.prev = p.start, p.start
+	}
+	if now.Sub(p.mark) >= speedWindow {
+		p.prev, p.prevBytes = p.mark, p.markBytes
+		p.mark, p.markBytes = now, p.transferred
+	}
+	speed := int64(0)
+	if elapsed := now.Sub(p.prev).Seconds(); elapsed > 0 {
+		speed = int64(float64(p.transferred-p.prevBytes) / elapsed)
+	}
+	p.callback(Progress{p.name, p.transferred, p.total, speed})
 }
 
 // runChunks joins every worker before returning, including errors in the last job.
