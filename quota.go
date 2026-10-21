@@ -11,8 +11,14 @@ import (
 func (q *QuotaResp) UnmarshalJSON(data []byte) error {
 	type plain QuotaResp
 	var fields map[string]json.RawMessage
-	if json.Unmarshal(data, &fields) != nil {
+	if json.Unmarshal(data, &fields) != nil || fields == nil {
 		return EBADRESP
+	}
+	for _, required := range []string{"mstrg", "cstrg"} {
+		value, ok := fields[required]
+		if !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return EBADRESP
+		}
 	}
 	for _, name := range []string{"mstrg", "cstrg", "mxfer", "caxfer", "csxfer", "utype", "suntil"} {
 		raw, ok := fields[name]

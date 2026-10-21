@@ -16,3 +16,12 @@ func TestQuotaDecimalStrings(t *testing.T) {
 		}
 	}
 }
+
+func TestQuotaRejectsMissingCounters(t *testing.T) {
+	for _, body := range []string{`null`, `{}`, `{"mstrg":100}`, `{"mstrg":null,"cstrg":0}`} {
+		var q QuotaResp
+		if err := json.Unmarshal([]byte(body), &q); err == nil {
+			t.Fatal("accepted missing quota counters")
+		}
+	}
+}

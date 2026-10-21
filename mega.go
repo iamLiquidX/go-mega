@@ -373,6 +373,15 @@ func (m *Mega) SetClient(client *http.Client) *Mega {
 	return m
 }
 
+// SetTimeOut sets the total deadline for each HTTP request, including body reads.
+// Configure the client before starting concurrent operations.
+func (m *Mega) SetTimeOut(timeout time.Duration) {
+	m.config.SetTimeOut(timeout)
+	client := *m.client
+	client.Timeout = timeout
+	m.client = &client
+}
+
 // discardLogf discards the log messages
 func discardLogf(format string, v ...any) {
 }

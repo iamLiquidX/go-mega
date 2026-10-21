@@ -55,6 +55,8 @@ Live upload acceptance remains deferred pending a usable test account.
 `SaveSession` and `LoadSession` support reuse without repeated password login.
 Session files contain credentials equivalent to a password: keep them outside
 source control, use private permissions, and set an explicit user-only Windows ACL.
+Default HTTP requests have a 10-second deadline including body reads; configure
+`SetTimeOut` before concurrent operations when slower connections require more time.
 Cancel active operation contexts before `Close`. The legacy `Login` API retains
 upstream's event-polling behavior; use `LoginContext` for the new workflow.
 

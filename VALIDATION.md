@@ -15,6 +15,7 @@ live upload acceptance with a replacement test account.
 | Deterministic tests and `go vet` | Passed |
 | Windows race detector, Go 1.26.10 | Passed |
 | Linux compilation, Go 1.26.10 | Passed |
+| GitHub CI: Ubuntu Go 1.24/1.26 and Windows Go 1.26 | Passed: race tests, vet, fuzz; Ubuntu 1.26 vulnerability scan clean |
 | Link-parser fuzz smoke test | Passed, 85,852 executions |
 | Encrypted-attribute fuzz smoke test | Passed, 115,436 executions |
 | `govulncheck`, Go 1.26.10 | No vulnerabilities found |
@@ -53,7 +54,7 @@ unordered trees, linked files/subfolders, missing/disconnected nodes, malformed
 attributes/session data, unsafe and conflicting filenames, zero-byte files,
 empty directories, chunk boundaries, corruption, missing chunks, short bodies,
 expired URL refresh, quota errors, positive quota advisory codes, last-worker
-errors, cancellation cleanup, and concurrent operations/publication.
+errors, stalled response-body deadlines, cancellation cleanup, and concurrent operations/publication.
 
 An independent local MEGA fixture validates uploaded AES-CTR payloads, packed keys,
 folder owner authentication and every descendant's share key. Recursive uploads
@@ -86,4 +87,7 @@ environment variables and are not embedded in tests.
 
 Before application integration: run live file/folder upload/export/public-download
 round trips with the replacement account; retain or fix failures in this fork;
-validate Linux runtime via CI; pin the resulting tested commit in MirrorLeechX.
+pin the resulting tested commit in MirrorLeechX after live upload acceptance.
+Linux runtime tests already pass in GitHub CI.
+
+CI run for the implementation baseline: https://github.com/iamLiquidX/go-mega/actions/runs/39560692334

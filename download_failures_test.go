@@ -113,3 +113,31 @@ func TestQuotaPositiveStatesAreNotErrors(t *testing.T) {
 		t.Fatalf("quota state=%d err=%v", state, err)
 	}
 }
+
+func TestStalledBodyHasBoundedRequestDeadline(t *testing.T) {
+	stopped := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "8")
+		w.WriteHeader(200)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+		stopped <- struct{}{}
+	}))
+	defer server.Close()
+	m := New()
+	defer m.Close()
+	m.SetRetries(0)
+	m.SetTimeOut(100 * time.Millisecond)
+	start := time.Now()
+	if _, err := m.transferRequest(context.Background(), "GET", server.URL, nil, 8, true); err == nil {
+		t.Fatal("stalled body succeeded")
+	}
+	if time.Since(start) > 3*time.Second {
+		t.Fatal("stalled body ignored deadline")
+	}
+	select {
+	case <-stopped:
+	case <-time.After(3 * time.Second):
+		t.Fatal("stalled body request leaked")
+	}
+}
