@@ -26,8 +26,10 @@ live upload acceptance with a replacement test account.
 | Live anonymous public folder | Passed: 13 files, 587,954,396 bytes, all sizes/MACs/hierarchy |
 | Live account-authenticated public folder | Passed: 13 files, all sizes/MACs/hashes match anonymous output |
 | Live file within public folder | Passed: 14,862,281 bytes, MAC and SHA-256 match recursive output |
-| Nested subfolder links | Deterministic fixture passed; supplied small folder has no nested directories |
-| Live file/folder uploads | Deferred by user pending replacement account |
+| Nested subfolder links | Passed live using uploaded nested fixture, including empty directories and Unicode filenames |
+| Live small file upload | Passed: export and anonymous/authenticated re-download with matching SHA-256 |
+| Live nested folder upload | Passed: secure share, anonymous/authenticated re-download, complete hierarchy and hashes |
+| Live original downloaded content upload | In progress: 185,549,130-byte file and 587,954,396-byte folder |
 | Official-SDK download comparison | Not run; SDK used as source reference |
 | Pro transfer-allowance accounting | Not established by this account's download success |
 
@@ -40,7 +42,12 @@ directory was removed. It is not counted as a completed download test.
 
 The first account permitted login/read operations but rejected isolated folder
 creation with API -16. No upload succeeded and no existing account content was
-modified. Live upload testing must use the replacement account.
+modified. The replacement account permits uploads. Live testing found two issues
+that permissive fixtures had missed: legacy `s2` share creation is rejected on
+secure-key accounts, and folder listings without `r=1` omit nested descendants.
+Both are fixed and covered by stricter fixtures. The nested live acceptance test
+then passed in 110.13 seconds, including anonymous/authenticated folder downloads
+and a selected subfolder download.
 
 Linked-file SHA-256: `c2efd503ebe619cdbc8695cad1d678f2f6f5d3bd1cdee0cd39e139e77a8afa03`.
 
@@ -59,7 +66,12 @@ errors, stalled response-body deadlines, cancellation cleanup, and concurrent op
 An independent local MEGA fixture validates uploaded AES-CTR payloads, packed keys,
 folder owner authentication and every descendant's share key. Recursive uploads
 round-trip through anonymous public downloads, including Unicode and empty files.
-These are protocol fixtures, not a substitute for live upload acceptance.
+Both legacy and secure-key folder sharing are exercised. An independent Python
+cryptography HKDF-SHA256/AES-GCM vector verifies secure repository decoding.
+Repository tests cover unrelated/private/unknown field preservation, existing-key
+reuse, version-conflict retries, corruption, identity/version mismatches, malformed
+TLV/share records and generation overflow. These fixtures complement the live
+small file and nested folder round trips.
 
 ## Measurements
 

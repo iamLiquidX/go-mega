@@ -27,16 +27,17 @@ type fixtureUpload struct {
 	token    string
 }
 type uploadFixture struct {
-	mu        sync.Mutex
-	master    []byte
-	nodes     map[string]FSNode
-	uploads   map[string]*fixtureUpload
-	contents  map[string][]byte
-	shares    map[string][]byte
-	public    map[string]string
-	next      int
-	failFinal bool
-	shareSeen bool
+	mu         sync.Mutex
+	master     []byte
+	nodes      map[string]FSNode
+	uploads    map[string]*fixtureUpload
+	contents   map[string][]byte
+	shares     map[string][]byte
+	public     map[string]string
+	next       int
+	failFinal  bool
+	shareSeen  bool
+	repository []byte
 }
 
 func newUploadFixture(t *testing.T) (*Mega, *uploadFixture) {
@@ -156,6 +157,41 @@ func (s *uploadFixture) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		s.nodes[handle] = node
 		reply(UploadCompleteResp{F: []FSNode{node}})
+	case "ug":
+		reply(map[string]any{"u": "AAAAAAAAAAA", "email": "fixture@example.invalid"})
+	case "uga":
+		if s.repository != nil {
+			reply(map[string]string{"av": base64urlencode(s.repository), "v": "fixture-version"})
+			return
+		}
+		reply(-9)
+	case "upv":
+		var values []json.RawMessage
+		if json.Unmarshal(request["^!keys"], &values) != nil || len(values) != 3 {
+			reply(-2)
+			return
+		}
+		var encoded string
+		json.Unmarshal(values[0], &encoded)
+		container, err := base64urldecode(encoded)
+		if err != nil {
+			reply(-14)
+			return
+		}
+		fields, err := decodeRepository(s.master, container)
+		if err != nil {
+			reply(-14)
+			return
+		}
+		for _, field := range fields {
+			if field.tag == 48 {
+				for offset := 0; offset+23 <= len(field.value); offset += 23 {
+					s.shares[base64urlencode(field.value[offset:offset+6])] = append([]byte(nil), field.value[offset+6:offset+22]...)
+				}
+			}
+		}
+		s.repository = container
+		reply(map[string]string{"^!keys": "fixture-new-version"})
 	case "s2":
 		master, _ := aes.NewCipher(s.master)
 		share, err := base64urldecode(str("ok"))
@@ -164,7 +200,18 @@ func (s *uploadFixture) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		auth, _ := base64urldecode(str("ha"))
-		if blockDecrypt(master, auth, auth) != nil || string(auth) != str("n")+str("n") {
+		if s.repository != nil {
+			owner, _ := base64urldecode(str("ok"))
+			if !bytes.Equal(owner, make([]byte, 16)) || !bytes.Equal(auth, make([]byte, 16)) {
+				reply(-14)
+				return
+			}
+			share = s.shares[str("n")]
+			if len(share) != 16 {
+				reply(-14)
+				return
+			}
+		} else if blockDecrypt(master, auth, auth) != nil || string(auth) != str("n")+str("n") {
 			reply(-14)
 			return
 		}
@@ -211,6 +258,10 @@ func (s *uploadFixture) serve(w http.ResponseWriter, r *http.Request) {
 		s.public[handle] = str("n")
 		reply(handle)
 	case "f":
+		if string(request["r"]) != "1" {
+			reply(-2)
+			return
+		}
 		root := s.public[r.URL.Query().Get("n")]
 		share := s.shares[root]
 		if len(share) != 16 {
@@ -254,7 +305,16 @@ func (s *uploadFixture) serve(w http.ResponseWriter, r *http.Request) {
 }
 
 func TestUploadPublicRoundTrip(t *testing.T) {
+	for _, secure := range []bool{false, true} {
+		t.Run(fmt.Sprintf("secure=%t", secure), func(t *testing.T) { testUploadPublicRoundTrip(t, secure) })
+	}
+}
+
+func testUploadPublicRoundTrip(t *testing.T, secure bool) {
 	m, state := newUploadFixture(t)
+	if secure {
+		state.repository, _ = base64urldecode(repositoryVector)
+	}
 	root := filepath.Join(t.TempDir(), "bundle")
 	os.MkdirAll(filepath.Join(root, "nested", "empty"), 0700)
 	for _, name := range []string{"zero.bin", "nested/日本語.txt", "nested/large.bin"} {

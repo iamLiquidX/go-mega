@@ -920,6 +920,7 @@ func (m *Mega) getFileSystem() error {
 
 	msg[0].Cmd = "f"
 	msg[0].C = 1
+	msg[0].R = 1
 
 	req, err := json.Marshal(msg)
 	if err != nil {

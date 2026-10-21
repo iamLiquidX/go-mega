@@ -16,7 +16,7 @@ import (
 // FetchNodesContext loads the account tree on demand, without background polling.
 // Call before concurrent uploads that need the account root.
 func (m *Mega) FetchNodesContext(ctx context.Context) error {
-	payload, _ := json.Marshal([]FilesMsg{{Cmd: "f", C: 1}})
+	payload, _ := json.Marshal([]FilesMsg{{Cmd: "f", C: 1, R: 1}})
 	body, err := m.apiRequest(ctx, payload, "")
 	if err != nil {
 		return err
@@ -194,6 +194,10 @@ func (m *Mega) ExportContext(ctx context.Context, node *Node) (string, error) {
 				return "", err
 			}
 		}
+		share, secure, err := m.secureShareKey(ctx, hash, share)
+		if err != nil {
+			return "", fmt.Errorf("folder share key repository: %w", err)
+		}
 		block, _ := aes.NewCipher(share)
 		var handles []string
 		var encryptedKeys []any
@@ -239,13 +243,17 @@ func (m *Mega) ExportContext(ctx context.Context, node *Node) (string, error) {
 			return "", err
 		}
 		request := map[string]any{"a": "s2", "n": hash, "ok": base64urlencode(ownerKey), "ha": base64urlencode(auth), "s": []any{map[string]any{"u": "EXP", "r": 0}}}
-		if !exists {
+		if secure {
+			request["ok"] = base64urlencode(make([]byte, 16))
+			request["ha"] = base64urlencode(make([]byte, 16))
+		}
+		if !exists || secure {
 			request["cr"] = []any{[]string{hash}, handles, encryptedKeys}
 		}
 		payload, _ := json.Marshal([]any{request})
 		body, err := m.apiRequest(ctx, payload, "")
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("establish folder share: %w", err)
 		}
 		var response [1]struct {
 			R  []ErrorMsg      `json:"r"`
@@ -258,7 +266,7 @@ func (m *Mega) ExportContext(ctx context.Context, node *Node) (string, error) {
 			return "", EKEY
 		}
 		if err = parseError(response[0].R[0]); err != nil {
-			return "", err
+			return "", fmt.Errorf("folder share response: %w", err)
 		}
 		m.FS.mutex.Lock()
 		m.FS.skmap[hash] = base64urlencode(ownerKey)
@@ -268,7 +276,7 @@ func (m *Mega) ExportContext(ctx context.Context, node *Node) (string, error) {
 	payload, _ := json.Marshal([]GetLinkMsg{{Cmd: "l", N: hash}})
 	body, err := m.apiRequest(ctx, payload, "")
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("export public link: %w", err)
 	}
 	var response [1]string
 	if json.Unmarshal(body, &response) != nil || !validHandle(response[0]) {

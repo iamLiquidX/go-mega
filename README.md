@@ -50,7 +50,11 @@ For uploads, call `FetchNodesContext` once, then pass `client.FS.GetRoot()` or a
 owned directory to `UploadPath`. Directories and empty descendants are preserved.
 The result includes the new root and its exported share URL. On partial failure,
 inspect the returned root; account data is never automatically deleted.
-Live upload acceptance remains deferred pending a usable test account.
+Folder exports support MEGA's secure key repository (`^!keys`): existing keys
+and unknown fields are preserved, and version conflicts trigger a fresh read.
+Legacy accounts without that repository use the legacy sharing protocol. Invalid
+or unsupported repositories fail without being overwritten. See VALIDATION.md
+for live upload acceptance results.
 
 `SaveSession` and `LoadSession` support reuse without repeated password login.
 Session files contain credentials equivalent to a password: keep them outside
@@ -90,6 +94,10 @@ For account tests, set `MEGA_SESSION_FILE`, or supply `MEGA_TEST_EMAIL` and
 `TestLiveAccount` reads account metadata. `TestLiveRoundTrip` creates a uniquely
 named remote test folder, performs uploads and public downloads, and deletes only
 that test folder in cleanup. Never supply credentials to untrusted test changes.
+`TestLiveDownloadedContentRoundTrip` additionally uploads existing controlled local
+content supplied with `MEGA_TEST_LOCAL_FILE` and `MEGA_TEST_LOCAL_FOLDER`, exports
+both roots and anonymously re-downloads them to compare all SHA-256 hashes. Run
+with `-timeout 65m`; it also removes only its uniquely created remote sandbox.
 
 ## Reference
 
@@ -97,6 +105,9 @@ Protocol reference: MEGA SDK v10.21.0,
 `d1c0cb76cb98598d93b9fb0bb89612daeb0fb39c`.
 Public-link design also reviewed upstream PR #62; the implementation below uses
 operation-local scope rather than replacing account state with public-folder keys.
+
+Secure repository format reference:
+[MEGA webclient key manager](https://github.com/meganz/webclient/blob/4e7a2c31ded96a077a6fd4819e7f08cdba3ece22/js/keymgr.js).
 
 Additional legacy account and filesystem APIs are inherited from
 [upstream go-mega](https://github.com/t3rm1n4l/go-mega).

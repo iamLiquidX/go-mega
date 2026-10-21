@@ -182,7 +182,7 @@ func (m *Mega) ResolvePublic(ctx context.Context, raw string) (*PublicResource, 
 		resource.root = &Node{fs: fs, name: attr.Name, hash: link.Handle, ntype: FILE, size: int64(response[0].Size), meta: meta, publicHandle: link.Handle}
 	} else {
 		resource.folder = link.Handle
-		payload, _ := json.Marshal([]FilesMsg{{Cmd: "f", C: 1}})
+		payload, _ := json.Marshal([]FilesMsg{{Cmd: "f", C: 1, R: 1}})
 		body, err := m.apiRequest(ctx, payload, link.Handle)
 		if err != nil {
 			return nil, err

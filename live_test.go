@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -88,11 +89,22 @@ func compareLiveTree(t *testing.T, want, got string) {
 				out[relative] = [32]byte{}
 				return nil
 			}
-			data, err := os.ReadFile(path)
+			file, err := os.Open(path)
 			if err != nil {
 				return err
 			}
-			out[relative] = sha256.Sum256(data)
+			hash := sha256.New()
+			_, copyErr := io.Copy(hash, file)
+			closeErr := file.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+			var sum [32]byte
+			copy(sum[:], hash.Sum(nil))
+			out[relative] = sum
 			return nil
 		})
 		if err != nil {
