@@ -96,7 +96,8 @@ named remote test folder, performs uploads and public downloads, and deletes onl
 that test folder in cleanup. Never supply credentials to untrusted test changes.
 `TestLiveDownloadedContentRoundTrip` additionally uploads existing controlled local
 content supplied with `MEGA_TEST_LOCAL_FILE` and `MEGA_TEST_LOCAL_FOLDER`, exports
-both roots and anonymously re-downloads them to compare all SHA-256 hashes. Run
+both roots and anonymously re-downloads them to compare all SHA-256 hashes. The
+supplied 185.5 MB file and 588.0 MB folder passed this live acceptance test. Run
 with `-timeout 65m`; it also removes only its uniquely created remote sandbox.
 
 ## Reference

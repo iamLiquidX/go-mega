@@ -5,9 +5,10 @@ Protocol reference: MEGA SDK v10.21.0 (`d1c0cb76cb98598d93b9fb0bb89612daeb0fb39c
 
 ## Status
 
-Library implementation and deterministic acceptance harness are complete for this
-iteration. MirrorLeechX is unchanged. Application integration remains gated on
-live upload acceptance with a replacement test account.
+Core download/upload live acceptance passed with the supplied controlled content
+and replacement upload account. MirrorLeechX is unchanged. The standalone fork
+is ready for the application integration phase for these tested transfer paths.
+Official-SDK runtime comparison and Pro allowance accounting remain unverified.
 
 | Check | Result |
 | --- | --- |
@@ -29,7 +30,7 @@ live upload acceptance with a replacement test account.
 | Nested subfolder links | Passed live using uploaded nested fixture, including empty directories and Unicode filenames |
 | Live small file upload | Passed: export and anonymous/authenticated re-download with matching SHA-256 |
 | Live nested folder upload | Passed: secure share, anonymous/authenticated re-download, complete hierarchy and hashes |
-| Live original downloaded content upload | In progress: 185,549,130-byte file and 587,954,396-byte folder |
+| Live original downloaded content upload | Passed: 185,549,130-byte file and 587,954,396-byte folder; exported links re-downloaded anonymously, every MAC/length/hierarchy/SHA-256 matched |
 | Official-SDK download comparison | Not run; SDK used as source reference |
 | Pro transfer-allowance accounting | Not established by this account's download success |
 
@@ -48,6 +49,11 @@ secure-key accounts, and folder listings without `r=1` omit nested descendants.
 Both are fixed and covered by stricter fixtures. The nested live acceptance test
 then passed in 110.13 seconds, including anonymous/authenticated folder downloads
 and a selected subfolder download.
+
+The original downloaded file and 13-file folder subsequently passed full live
+upload/export/anonymous-download acceptance in 642.42 seconds total. Test cleanup
+removed only the uniquely created remote sandbox and reported no errors. Account
+passwords, session files, public link keys and downloaded content are not committed.
 
 Linked-file SHA-256: `c2efd503ebe619cdbc8695cad1d678f2f6f5d3bd1cdee0cd39e139e77a8afa03`.
 
@@ -81,6 +87,9 @@ Observed live runs on this machine/network:
 - Authenticated public file: 35.764 s, 4.95 MiB/s.
 - Anonymous 13-file folder: 111.353 s, 5.04 MiB/s (8 chunk workers).
 - Authenticated 13-file folder: 220.709 s, 2.54 MiB/s (8 chunk workers).
+- Original file upload/export: 275.218 s; anonymous re-download/hash check: 23.955 s.
+- Original folder upload/export: 232.283 s; anonymous re-download/tree/hash check: 108.722 s.
+- Content uploads used 4 workers; round-trip downloads used 8 workers and 30-second request deadlines.
 
 These are individual network observations, not a controlled speed comparison.
 
@@ -97,9 +106,12 @@ content are not committed. The local reusable session lives under `.git` with an
 explicit user-only Windows ACL. Public URLs/keys are supplied through process
 environment variables and are not embedded in tests.
 
-Before application integration: run live file/folder upload/export/public-download
-round trips with the replacement account; retain or fix failures in this fork;
-pin the resulting tested commit in MirrorLeechX after live upload acceptance.
+The requested live file/folder upload/export/public-download round trips passed.
+Pin the validated fork commit when implementing MirrorLeechX integration, and
+validate the application's queue/progress/cancellation/error mapping separately.
 Linux runtime tests already pass in GitHub CI.
 
 CI run for the implementation baseline: https://github.com/iamLiquidX/go-mega/actions/runs/39560692334
+
+CI run for the secure folder-share and recursive listing fixes:
+https://github.com/iamLiquidX/go-mega/actions/runs/39565137538 (all jobs passed).
