@@ -1,0 +1,37 @@
+name: Fork validation
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            go: '1.24.x'
+          - os: ubuntu-latest
+            go: '1.26.x'
+          - os: windows-latest
+            go: '1.26.x'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+          cache: false
+      - run: go test -race -timeout 3m ./...
+      - run: go vet ./...
+      - name: Fuzz public link parsing
+        run: go test -run '^$' -fuzz '^FuzzParsePublicLink$' -fuzztime 5s -parallel 2
+      - name: Fuzz encrypted attributes
+        run: go test -run '^$' -fuzz '^FuzzDecryptAttr$' -fuzztime 5s -parallel 2
+      - name: Check vulnerabilities
+        if: matrix.os == 'ubuntu-latest' && matrix.go == '1.26.x'
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...

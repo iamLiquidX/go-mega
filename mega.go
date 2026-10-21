@@ -2,25 +2,25 @@ package mega
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha512"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math/big"
-	mrand "math/rand"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
-	"golang.org/x/crypto/pbkdf2"
+	"crypto/pbkdf2"
 )
 
 // Default settings
@@ -75,7 +75,7 @@ func (c *config) SetRetries(r int) {
 
 // Set concurrent download workers
 func (c *config) SetDownloadWorkers(w int) error {
-	if w <= MAX_DOWNLOAD_WORKERS {
+	if w > 0 && w <= MAX_DOWNLOAD_WORKERS {
 		c.dl_workers = w
 		return nil
 	}
@@ -90,7 +90,7 @@ func (c *config) SetTimeOut(t time.Duration) {
 
 // Set concurrent upload workers
 func (c *config) SetUploadWorkers(w int) error {
-	if w <= MAX_UPLOAD_WORKERS {
+	if w > 0 && w <= MAX_UPLOAD_WORKERS {
 		c.ul_workers = w
 		return nil
 	}
@@ -127,7 +127,8 @@ type Mega struct {
 	logf   func(format string, v ...any)
 	debugf func(format string, v ...any)
 	// serialize the API requests
-	apiMu sync.Mutex
+	apiGate    chan struct{}
+	exportGate chan struct{}
 	// mutex to protext waitEvents
 	waitEventsMu sync.Mutex
 	// Outstanding channels to close to indicate events all received
@@ -145,15 +146,17 @@ const (
 
 // Filesystem node
 type Node struct {
-	fs       *MegaFS
-	name     string
-	hash     string
-	parent   *Node
-	children []*Node
-	ntype    int
-	size     int64
-	ts       time.Time
-	meta     NodeMeta
+	fs           *MegaFS
+	name         string
+	hash         string
+	parent       *Node
+	children     []*Node
+	ntype        int
+	size         int64
+	ts           time.Time
+	meta         NodeMeta
+	publicHandle string
+	folderHandle string
 }
 
 func (n *Node) removeChild(c *Node) bool {
@@ -352,10 +355,12 @@ func New() *Mega {
 	cfg := newConfig()
 	mgfs := newMegaFS()
 	m := &Mega{
-		config: cfg,
-		sn:     bigx.Int64(),
-		FS:     mgfs,
-		client: newHttpClient(cfg.timeout),
+		config:     cfg,
+		apiGate:    make(chan struct{}, 1),
+		exportGate: make(chan struct{}, 1),
+		sn:         bigx.Int64(),
+		FS:         mgfs,
+		client:     newHttpClient(cfg.timeout),
 	}
 	m.SetLogger(log.Printf)
 	m.SetDebugger(nil)
@@ -378,7 +383,7 @@ func (m *Mega) GetSessionID() string {
 }
 
 func (m *Mega) GetMasterKey() []byte {
-	return m.k
+	return append([]byte(nil), m.k...)
 }
 
 // "Login" using the session ID (for API auth) and master key (for decryption). Alternative to logging in with username/password
@@ -422,138 +427,13 @@ func backOffSleep(pt *time.Duration) {
 }
 
 // API request method
-func (m *Mega) api_request(r []byte) (buf []byte, err error) {
-	var resp *http.Response
-	// serialize the API requests
-	m.apiMu.Lock()
-	defer func() {
-		m.sn++
-		m.apiMu.Unlock()
-	}()
-
-	url := fmt.Sprintf("%s/cs?id=%d", m.baseurl, m.sn)
-
-	if m.sid != "" {
-		url = fmt.Sprintf("%s&sid=%s", url, m.sid)
-	}
-
-	sleepTime := minSleepTime // initial backoff time
-	for i := 0; i < m.retries+1; i++ {
-		if i != 0 {
-			m.debugf("Retry API request %d/%d: %v", i, m.retries, err)
-			backOffSleep(&sleepTime)
-		}
-
-		// Create request
-		req, err := http.NewRequest("POST", url, bytes.NewBuffer(r))
-		if err != nil {
-			continue
-		}
-		addRequestHeaders(req)
-
-		// Send request
-		resp, err = m.client.Do(req)
-		if err != nil {
-			continue
-		}
-
-		// Handle 402 Payment Required status with hashcash challenge
-		if resp.StatusCode == 402 {
-			sleepTime = minSleepTime // reset exp backoff time
-			hashCashHeader := resp.Header.Get("X-Hashcash")
-			if hashCashHeader == "" {
-				_ = resp.Body.Close()
-				continue
-			}
-
-			// Parse hashcash header
-			easiness, token, valid := parseHashcash(hashCashHeader)
-			if !valid {
-				_ = resp.Body.Close()
-				continue
-			}
-
-			// Close the current response before making a new request
-			_ = resp.Body.Close()
-
-			// Generate hashcash response
-			cashValue, err := solveHashCashChallenge(token, easiness, HASHCASH_CHALLENGE_TIMEOUT, halfCPUCores())
-			if err != nil {
-				m.debugf("Failed to solve hashcash challenge: %v", err)
-				continue
-			}
-			if cashValue == "" {
-				m.debugf("Failed to solve hashcash challenge: empty cash value")
-				continue
-			}
-
-			// Create a new request with the hashcash header
-			req, err = http.NewRequest("POST", url, bytes.NewBuffer(r))
-			if err != nil {
-				continue
-			}
-			addHashCashRequestHeaders(req, token, cashValue)
-			// Send the new request
-			resp, err = m.client.Do(req)
-			if err != nil {
-				continue
-			}
-
-			// If still getting 402, give up this attempt and retry
-			if resp.StatusCode == 402 {
-				_ = resp.Body.Close()
-				continue
-			}
-		}
-
-		if resp.StatusCode != 200 {
-			// err must be not-nil on a continue
-			_ = resp.Body.Close()
-			continue
-		}
-
-		buf, err = io.ReadAll(resp.Body)
-		if err != nil {
-			_ = resp.Body.Close()
-			continue
-		}
-		err = resp.Body.Close()
-		if err != nil {
-			continue
-		}
-
-		// at this point the body is read and closed
-
-		if !bytes.HasPrefix(buf, []byte("[")) && !bytes.HasPrefix(buf, []byte("-")) {
-			return nil, EBADRESP
-		}
-
-		if len(buf) < 6 {
-			var emsg [1]ErrorMsg
-			err = json.Unmarshal(buf, &emsg)
-			if err != nil {
-				err = json.Unmarshal(buf, &emsg[0])
-			}
-			if err != nil {
-				return buf, EBADRESP
-			}
-			err = parseError(emsg[0])
-			if err == EAGAIN {
-				continue
-			}
-			return buf, err
-		}
-
-		if err == nil {
-			return buf, nil
-		}
-	}
-
-	return nil, err
+func (m *Mega) api_request(r []byte) ([]byte, error) {
+	return m.apiRequest(context.Background(), r, "")
 }
 
 // prelogin call
-func (m *Mega) prelogin(email string) error {
+func (m *Mega) prelogin(email string) error { return m.preloginContext(context.Background(), email) }
+func (m *Mega) preloginContext(ctx context.Context, email string) error {
 	var msg [1]PreloginMsg
 	var res [1]PreloginResp
 
@@ -566,7 +446,7 @@ func (m *Mega) prelogin(email string) error {
 	if err != nil {
 		return err
 	}
-	result, err := m.api_request(req)
+	result, err := m.apiRequest(ctx, req, "")
 	if err != nil {
 		return err
 	}
@@ -596,6 +476,9 @@ func (m *Mega) prelogin(email string) error {
 
 // Authenticate and start a session
 func (m *Mega) login(email string, passwd string, multiFactor string) error {
+	return m.loginContext(context.Background(), email, passwd, multiFactor)
+}
+func (m *Mega) loginContext(ctx context.Context, email string, passwd string, multiFactor string) error {
 	var msg [1]LoginMsg
 	var res [1]LoginResp
 	var err error
@@ -622,7 +505,10 @@ func (m *Mega) login(email string, passwd string, multiFactor string) error {
 		msg[0].Handle = uhandle
 	} else {
 		const derivedKeyLength = 2 * aes.BlockSize
-		derivedKey := pbkdf2.Key([]byte(passwd), m.accountSalt, 100000, derivedKeyLength, sha512.New)
+		derivedKey, err := pbkdf2.Key(sha512.New, passwd, m.accountSalt, 100000, derivedKeyLength)
+		if err != nil {
+			return err
+		}
 		authKey := derivedKey[aes.BlockSize:]
 		passkey = derivedKey[:aes.BlockSize]
 
@@ -639,7 +525,7 @@ func (m *Mega) login(email string, passwd string, multiFactor string) error {
 	if err != nil {
 		return err
 	}
-	result, err = m.api_request(req)
+	result, err = m.apiRequest(ctx, req, "")
 	if err != nil {
 		return err
 	}
@@ -656,6 +542,9 @@ func (m *Mega) login(email string, passwd string, multiFactor string) error {
 	cipher, err := aes.NewCipher(passkey)
 	if err != nil {
 		return err
+	}
+	if len(m.k) != aes.BlockSize {
+		return EBADRESP
 	}
 	cipher.Decrypt(m.k, m.k)
 	m.sid, err = decryptSessionId(res[0].Privk, res[0].Csid, m.k)
@@ -747,6 +636,10 @@ func (m *Mega) waitEventsFire() {
 
 // Get user information
 func (m *Mega) GetUser() (UserResp, error) {
+	return m.GetUserContext(context.Background())
+}
+
+func (m *Mega) GetUserContext(ctx context.Context) (UserResp, error) {
 	var msg [1]UserMsg
 	var res [1]UserResp
 
@@ -756,7 +649,7 @@ func (m *Mega) GetUser() (UserResp, error) {
 	if err != nil {
 		return res[0], err
 	}
-	result, err := m.api_request(req)
+	result, err := m.apiRequest(ctx, req, "")
 	if err != nil {
 		return res[0], err
 	}
@@ -767,18 +660,23 @@ func (m *Mega) GetUser() (UserResp, error) {
 
 // Get quota information
 func (m *Mega) GetQuota() (QuotaResp, error) {
+	return m.GetQuotaContext(context.Background())
+}
+
+func (m *Mega) GetQuotaContext(ctx context.Context) (QuotaResp, error) {
 	var msg [1]QuotaMsg
 	var res [1]QuotaResp
 
 	msg[0].Cmd = "uq"
 	msg[0].Xfer = 1
 	msg[0].Strg = 1
+	msg[0].Pro = 1
 
 	req, err := json.Marshal(msg)
 	if err != nil {
 		return res[0], err
 	}
-	result, err := m.api_request(req)
+	result, err := m.apiRequest(ctx, req, "")
 	if err != nil {
 		return res[0], err
 	}
@@ -803,7 +701,7 @@ func (m *Mega) addFSNode(itm FSNode) (*Node, error) {
 	case itm.T == FOLDER || itm.T == FILE:
 		args := strings.Split(itm.Key, ":")
 		if len(args) < 2 {
-			return nil, fmt.Errorf("not enough : in item.Key: %q", itm.Key)
+			return nil, fmt.Errorf("invalid account node key: %w", EKEY)
 		}
 		itemUser, itemKey := args[0], args[1]
 		itemKeyParts := strings.Split(itemKey, "/")
@@ -890,8 +788,7 @@ func (m *Mega) addFSNode(itm FSNode) (*Node, error) {
 		switch {
 		case itm.T == FILE:
 			if len(compkey) < 8 {
-				m.logf("ignoring item: compkey too short (%d): %#v", len(compkey), itm)
-				return nil, nil
+				return nil, EKEY
 			}
 			key = []uint32{compkey[0] ^ compkey[4], compkey[1] ^ compkey[5], compkey[2] ^ compkey[6], compkey[3] ^ compkey[7]}
 		default:
@@ -1036,7 +933,7 @@ func (m *Mega) getFileSystem() error {
 	for _, itm := range res[0].F {
 		_, err = m.addFSNode(itm)
 		if err != nil {
-			m.debugf("couldn't decode FSNode %#v: %v ", itm, err)
+			m.debugf("could not decode account node: %v", err)
 			continue
 		}
 	}
@@ -1053,6 +950,7 @@ type Download struct {
 	m           *Mega
 	src         *Node
 	resourceUrl string
+	urlMu       sync.Mutex
 	aes_block   cipher.Block
 	iv          []byte
 	mac_enc     cipher.BlockMode
@@ -1070,7 +968,11 @@ var zero_iv = make([]byte, 16)
 // 0..chunks-1 call DownloadChunk.  Finally call Finish() to receive
 // the error status.
 func (m *Mega) NewDownload(src *Node) (*Download, error) {
-	if src == nil {
+	return m.NewDownloadContext(context.Background(), src)
+}
+
+func (m *Mega) NewDownloadContext(ctx context.Context, src *Node) (*Download, error) {
+	if src == nil || src.GetType() != FILE || src.GetSize() < 0 {
 		return nil, EARGS
 	}
 
@@ -1080,8 +982,12 @@ func (m *Mega) NewDownload(src *Node) (*Download, error) {
 	m.FS.mutex.Lock()
 	msg[0].Cmd = "g"
 	msg[0].G = 1
-	msg[0].N = src.hash
-	if m.config.https {
+	if src.publicHandle != "" {
+		msg[0].P = src.publicHandle
+	} else {
+		msg[0].N = src.hash
+	}
+	if m.config.https || src.publicHandle != "" || src.folderHandle != "" {
 		msg[0].SSL = 2
 	}
 	key := src.meta.key
@@ -1091,7 +997,7 @@ func (m *Mega) NewDownload(src *Node) (*Download, error) {
 	if err != nil {
 		return nil, err
 	}
-	result, err := m.api_request(request)
+	result, err := m.apiRequest(ctx, request, src.folderHandle)
 	if err != nil {
 		return nil, err
 	}
@@ -1106,8 +1012,18 @@ func (m *Mega) NewDownload(src *Node) (*Download, error) {
 		return nil, parseError(res[0].Err)
 	}
 
-	_, err = decryptAttr(key, res[0].Attr)
-	if err != nil {
+	if res[0].Size > uint64(^uint64(0)>>1) || int64(res[0].Size) != src.size {
+		return nil, EBADRESP
+	}
+	if res[0].Attr != "" {
+		if _, err = decryptAttr(key, res[0].Attr); err != nil {
+			return nil, err
+		}
+	}
+	if len(src.meta.iv) != 16 || len(src.meta.mac) != 8 || res[0].G == "" {
+		return nil, EBADRESP
+	}
+	if err = validateTransferURL(res[0].G); err != nil {
 		return nil, err
 	}
 
@@ -1165,7 +1081,10 @@ func (d *Download) ChunkLocation(id int) (position int64, size int, err error) {
 
 // DownloadChunk gets a chunk with the given number and update the
 // mac, returning the position in the file of the chunk
-func (d *Download) DownloadChunk(id int) (chunk []byte, err error) {
+func (d *Download) DownloadChunk(id int) ([]byte, error) {
+	return d.DownloadChunkContext(context.Background(), id)
+}
+func (d *Download) DownloadChunkContext(ctx context.Context, id int) (chunk []byte, err error) {
 	if id < 0 || id >= len(d.chunks) {
 		return nil, EARGS
 	}
@@ -1175,43 +1094,25 @@ func (d *Download) DownloadChunk(id int) (chunk []byte, err error) {
 		return nil, err
 	}
 
-	var resp *http.Response
-	chunk_url := fmt.Sprintf("%s/%d-%d", d.resourceUrl, chk_start, chk_start+int64(chk_size)-1)
-	sleepTime := minSleepTime // initial backoff time
-	for retry := 0; retry < d.m.retries+1; retry++ {
-		resp, err = d.m.client.Get(chunk_url)
-		if err == nil {
-			if resp.StatusCode == 200 {
-				break
-			}
-			err = errors.New("Http Status: " + resp.Status)
-			_ = resp.Body.Close()
+	d.urlMu.Lock()
+	chunkURL := fmt.Sprintf("%s/%d-%d", d.resourceUrl, chk_start, chk_start+int64(chk_size)-1)
+	d.urlMu.Unlock()
+	chunk, err = d.m.transferRequest(ctx, "GET", chunkURL, nil, int64(chk_size), true)
+	if errors.Is(err, EEXPIRED) {
+		d.urlMu.Lock()
+		fresh, refreshErr := d.m.NewDownloadContext(ctx, d.src)
+		if refreshErr == nil {
+			d.resourceUrl = fresh.resourceUrl
 		}
-		d.m.debugf("%s: Retry download chunk %d/%d: %v", d.src.name, retry, d.m.retries, err)
-		backOffSleep(&sleepTime)
+		chunkURL = fmt.Sprintf("%s/%d-%d", d.resourceUrl, chk_start, chk_start+int64(chk_size)-1)
+		d.urlMu.Unlock()
+		if refreshErr != nil {
+			return nil, refreshErr
+		}
+		chunk, err = d.m.transferRequest(ctx, "GET", chunkURL, nil, int64(chk_size), true)
 	}
 	if err != nil {
 		return nil, err
-	}
-	if resp == nil {
-		return nil, errors.New("retries exceeded")
-	}
-
-	chunk, err = io.ReadAll(resp.Body)
-	if err != nil {
-		_ = resp.Body.Close()
-		return nil, err
-	}
-
-	err = resp.Body.Close()
-	if err != nil {
-		return nil, err
-	}
-
-	// body is read and closed here
-
-	if len(chunk) != chk_size {
-		return nil, errors.New("wrong size for downloaded chunk")
 	}
 
 	// Decrypt the block
@@ -1249,9 +1150,11 @@ func (d *Download) DownloadChunk(id int) (chunk []byte, err error) {
 
 // Finish checks the accumulated MAC for each block.
 //
-// If all the chunks weren't downloaded then it will just return nil
+// Missing chunks return EINCOMPLETE; call only after all workers have stopped.
 func (d *Download) Finish() (err error) {
-	// Can't check a 0 sized file
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+	// Empty files have no content MAC to check.
 	if len(d.chunk_macs) == 0 {
 		return nil
 	}
@@ -1260,9 +1163,9 @@ func (d *Download) Finish() (err error) {
 		// If a chunk_macs hasn't been set then the whole file
 		// wasn't downloaded and we can't check it
 		if v == nil {
-			return nil
+			return EINCOMPLETE
 		}
-		d.mac_enc.CryptBlocks(mac_data, v)
+		cipher.NewCBCEncrypter(d.aes_block, mac_data).CryptBlocks(mac_data, v)
 	}
 
 	tmac, err := bytes_to_a32(mac_data)
@@ -1282,91 +1185,14 @@ func (d *Download) Finish() (err error) {
 
 // Download file from filesystem reporting progress if not nil
 func (m *Mega) DownloadFile(src *Node, dstpath string, progress *chan int) error {
-	defer func() {
+	if progress != nil {
+		defer close(*progress)
+	}
+	return m.DownloadFileContext(context.Background(), src, dstpath, func(n int64) {
 		if progress != nil {
-			close(*progress)
+			*progress <- int(n)
 		}
-	}()
-
-	d, err := m.NewDownload(src)
-	if err != nil {
-		return err
-	}
-
-	_, err = os.Stat(dstpath)
-	if os.IsExist(err) {
-		err = os.Remove(dstpath)
-		if err != nil {
-			return err
-		}
-	}
-
-	outfile, err := os.OpenFile(dstpath, os.O_RDWR|os.O_CREATE, 0600)
-	if err != nil {
-		return err
-	}
-
-	workch := make(chan int)
-	errch := make(chan error, m.dl_workers)
-	wg := sync.WaitGroup{}
-
-	// Fire chunk download workers
-	for w := 0; w < m.dl_workers; w++ {
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
-			// Wait for work blocked on channel
-			for id := range workch {
-				chunk, err := d.DownloadChunk(id)
-				if err != nil {
-					errch <- err
-					return
-				}
-
-				chk_start, _, err := d.ChunkLocation(id)
-				if err != nil {
-					errch <- err
-					return
-				}
-
-				_, err = outfile.WriteAt(chunk, chk_start)
-				if err != nil {
-					errch <- err
-					return
-				}
-
-				if progress != nil {
-					*progress <- len(chunk)
-				}
-			}
-		}()
-	}
-
-	// Place chunk download jobs to chan
-	err = nil
-	for id := 0; id < d.Chunks() && err == nil; {
-		select {
-		case workch <- id:
-			id++
-		case err = <-errch:
-		}
-	}
-	close(workch)
-
-	wg.Wait()
-
-	closeErr := outfile.Close()
-	if err != nil {
-		_ = os.Remove(dstpath)
-		return err
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-
-	return d.Finish()
+	})
 }
 
 // Upload contains the internal state of a upload
@@ -1393,7 +1219,11 @@ type Upload struct {
 // 0..chunks-1 Call ChunkLocation then UploadChunk.  Finally call
 // Finish() to receive the error status and the *Node.
 func (m *Mega) NewUpload(parent *Node, name string, fileSize int64) (*Upload, error) {
-	if parent == nil {
+	return m.NewUploadContext(context.Background(), parent, name, fileSize)
+}
+
+func (m *Mega) NewUploadContext(ctx context.Context, parent *Node, name string, fileSize int64) (*Upload, error) {
+	if parent == nil || fileSize < 0 || parent.fs != m.FS || parent.GetType() == FILE {
 		return nil, EARGS
 	}
 
@@ -1411,7 +1241,7 @@ func (m *Mega) NewUpload(parent *Node, name string, fileSize int64) (*Upload, er
 	if err != nil {
 		return nil, err
 	}
-	result, err := m.api_request(request)
+	result, err := m.apiRequest(ctx, request, "")
 	if err != nil {
 		return nil, err
 	}
@@ -1423,7 +1253,9 @@ func (m *Mega) NewUpload(parent *Node, name string, fileSize int64) (*Upload, er
 
 	ukey := []uint32{0, 0, 0, 0, 0, 0}
 	for i := range ukey {
-		ukey[i] = uint32(mrand.Int31())
+		if err := binary.Read(rand.Reader, binary.BigEndian, &ukey[i]); err != nil {
+			return nil, err
+		}
 
 	}
 
@@ -1455,6 +1287,9 @@ func (m *Mega) NewUpload(parent *Node, name string, fileSize int64) (*Upload, er
 	}
 
 	uploadUrl := res[0].P
+	if err := validateTransferURL(uploadUrl); err != nil {
+		return nil, err
+	}
 	if m.config.https && strings.HasPrefix(uploadUrl, "http://") {
 		uploadUrl = "https://" + strings.TrimPrefix(uploadUrl, "http://")
 	}
@@ -1492,6 +1327,10 @@ func (u *Upload) ChunkLocation(id int) (position int64, size int, err error) {
 
 // UploadChunk uploads the chunk of id
 func (u *Upload) UploadChunk(id int, chunk []byte) (err error) {
+	return u.UploadChunkContext(context.Background(), id, chunk)
+}
+
+func (u *Upload) UploadChunkContext(ctx context.Context, id int, chunk []byte) (err error) {
 	chk_start, chk_size, err := u.ChunkLocation(id)
 	if err != nil {
 		return err
@@ -1521,50 +1360,25 @@ func (u *Upload) UploadChunk(id int, chunk []byte) (err error) {
 		enc.CryptBlocks(block, block)
 	}
 
-	var rsp *http.Response
-	var req *http.Request
-	ctr_aes.XORKeyStream(chunk, chunk)
-	chk_url := fmt.Sprintf("%s/%d", u.uploadUrl, chk_start)
-
-	sleepTime := minSleepTime // initial backoff time
-	for retry := 0; retry < u.m.retries+1; retry++ {
-		reader := bytes.NewBuffer(chunk)
-		req, err = http.NewRequest("POST", chk_url, reader)
-		if err != nil {
-			return err
+	// Never modify the caller's plaintext buffer.
+	encrypted := make([]byte, len(chunk))
+	ctr_aes.XORKeyStream(encrypted, chunk)
+	chunkURL := fmt.Sprintf("%s/%d", u.uploadUrl, chk_start)
+	chunkResponse, err := u.m.transferRequest(ctx, "POST", chunkURL, encrypted, 4096, false)
+	if err != nil {
+		return err
+	}
+	if len(chunkResponse) != 0 {
+		var code ErrorMsg
+		if json.Unmarshal(chunkResponse, &code) == nil && code < 0 {
+			return parseError(code)
 		}
-		rsp, err = u.m.client.Do(req)
-		if err == nil {
-			if rsp.StatusCode == 200 {
-				break
-			}
-			err = errors.New("Http Status: " + rsp.Status)
-			_ = rsp.Body.Close()
+		handle, err := base64urldecode(string(chunkResponse))
+		if err != nil || len(handle) != 27 {
+			return EBADRESP
 		}
-		u.m.debugf("%s: Retry upload chunk %d/%d: %v", u.name, retry, u.m.retries, err)
-		backOffSleep(&sleepTime)
-	}
-	if err != nil {
-		return err
-	}
-	if rsp == nil {
-		return errors.New("retries exceeded")
-	}
-
-	chunk_resp, err := io.ReadAll(rsp.Body)
-	if err != nil {
-		_ = rsp.Body.Close()
-		return err
-	}
-
-	err = rsp.Body.Close()
-	if err != nil {
-		return err
-	}
-
-	if !bytes.Equal(chunk_resp, nil) {
 		u.mutex.Lock()
-		u.completion_handle = chunk_resp
+		u.completion_handle = append([]byte(nil), chunkResponse...)
 		u.mutex.Unlock()
 	}
 
@@ -1581,9 +1395,21 @@ func (u *Upload) UploadChunk(id int, chunk []byte) (err error) {
 
 // Finish completes the upload and returns the created node
 func (u *Upload) Finish() (node *Node, err error) {
+	return u.FinishContext(context.Background())
+}
+
+func (u *Upload) FinishContext(ctx context.Context) (node *Node, err error) {
+	u.mutex.Lock()
+	defer u.mutex.Unlock()
+	if len(u.completion_handle) == 0 {
+		return nil, EINCOMPLETE
+	}
 	mac_data := make([]byte, 16)
 	for _, v := range u.chunk_macs {
-		u.mac_enc.CryptBlocks(mac_data, v)
+		if len(v) != 16 {
+			return nil, EINCOMPLETE
+		}
+		cipher.NewCBCEncrypter(u.aes_block, mac_data).CryptBlocks(mac_data, v)
 	}
 
 	t, err := bytes_to_a32(mac_data)
@@ -1630,7 +1456,7 @@ func (u *Upload) Finish() (node *Node, err error) {
 	if err != nil {
 		return nil, err
 	}
-	result, err := u.m.api_request(request)
+	result, err := u.m.apiRequest(ctx, request, "")
 	if err != nil {
 		return nil, err
 	}
@@ -1642,105 +1468,22 @@ func (u *Upload) Finish() (node *Node, err error) {
 
 	u.m.FS.mutex.Lock()
 	defer u.m.FS.mutex.Unlock()
+	if len(cres[0].F) != 1 {
+		return nil, EBADRESP
+	}
 	return u.m.addFSNode(cres[0].F[0])
 }
 
 // Upload a file to the filesystem
-func (m *Mega) UploadFile(srcpath string, parent *Node, name string, progress *chan int) (node *Node, err error) {
-	defer func() {
+func (m *Mega) UploadFile(srcpath string, parent *Node, name string, progress *chan int) (*Node, error) {
+	if progress != nil {
+		defer close(*progress)
+	}
+	return m.UploadFileContext(context.Background(), srcpath, parent, name, func(n int64) {
 		if progress != nil {
-			close(*progress)
+			*progress <- int(n)
 		}
-	}()
-
-	var infile *os.File
-	var fileSize int64
-
-	info, err := os.Stat(srcpath)
-	if err == nil {
-		fileSize = info.Size()
-	}
-
-	infile, err = os.OpenFile(srcpath, os.O_RDONLY, 0666)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		e := infile.Close()
-		if err == nil {
-			err = e
-		}
-	}()
-
-	if name == "" {
-		name = filepath.Base(srcpath)
-	}
-
-	u, err := m.NewUpload(parent, name, fileSize)
-	if err != nil {
-		return nil, err
-	}
-
-	workch := make(chan int)
-	errch := make(chan error, m.ul_workers)
-	wg := sync.WaitGroup{}
-
-	// Fire chunk upload workers
-	for w := 0; w < m.ul_workers; w++ {
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
-			for id := range workch {
-				chk_start, chk_size, err := u.ChunkLocation(id)
-				if err != nil {
-					errch <- err
-					return
-				}
-				chunk := make([]byte, chk_size)
-				n, err := infile.ReadAt(chunk, chk_start)
-				if err != nil && err != io.EOF {
-					errch <- err
-					return
-				}
-				if n != len(chunk) {
-					errch <- errors.New("chunk too short")
-					return
-				}
-
-				err = u.UploadChunk(id, chunk)
-				if err != nil {
-					errch <- err
-					return
-				}
-
-				if progress != nil {
-					*progress <- chk_size
-				}
-			}
-		}()
-	}
-
-	// Place chunk download jobs to chan
-	err = nil
-	for id := 0; id < u.Chunks() && err == nil; {
-		select {
-		case workch <- id:
-			id++
-		case err = <-errch:
-		}
-	}
-
-	close(workch)
-
-	wg.Wait()
-
-	if err != nil {
-		return nil, err
-	}
-
-	return u.Finish()
+	})
 }
 
 // Move a file from one location to another
@@ -1831,10 +1574,11 @@ func (m *Mega) Rename(src *Node, name string) error {
 
 // Create a directory in the filesystem
 func (m *Mega) CreateDir(name string, parent *Node) (*Node, error) {
-	m.FS.mutex.Lock()
-	defer m.FS.mutex.Unlock()
+	return m.CreateDirContext(context.Background(), name, parent)
+}
 
-	if parent == nil {
+func (m *Mega) CreateDirContext(ctx context.Context, name string, parent *Node) (*Node, error) {
+	if parent == nil || parent.fs != m.FS || parent.GetType() == FILE || !safeName(name) {
 		return nil, EARGS
 	}
 	var msg [1]UploadCompleteMsg
@@ -1842,7 +1586,9 @@ func (m *Mega) CreateDir(name string, parent *Node) (*Node, error) {
 
 	compkey := []uint32{0, 0, 0, 0, 0, 0}
 	for i := range compkey {
-		compkey[i] = uint32(mrand.Int31())
+		if err := binary.Read(rand.Reader, binary.BigEndian, &compkey[i]); err != nil {
+			return nil, err
+		}
 	}
 
 	master_aes, err := aes.NewCipher(m.k)
@@ -1865,7 +1611,7 @@ func (m *Mega) CreateDir(name string, parent *Node) (*Node, error) {
 	}
 
 	msg[0].Cmd = "p"
-	msg[0].T = parent.hash
+	msg[0].T = parent.GetHash()
 	msg[0].N[0].H = "xxxxxxxx"
 	msg[0].N[0].T = FOLDER
 	msg[0].N[0].A = attr_data
@@ -1879,7 +1625,7 @@ func (m *Mega) CreateDir(name string, parent *Node) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	result, err := m.api_request(req)
+	result, err := m.apiRequest(ctx, req, "")
 	if err != nil {
 		return nil, err
 	}
@@ -1888,6 +1634,11 @@ func (m *Mega) CreateDir(name string, parent *Node) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(res[0].F) != 1 {
+		return nil, EBADRESP
+	}
+	m.FS.mutex.Lock()
+	defer m.FS.mutex.Unlock()
 	node, err := m.addFSNode(res[0].F[0])
 
 	return node, err
@@ -1895,20 +1646,21 @@ func (m *Mega) CreateDir(name string, parent *Node) (*Node, error) {
 
 // Delete a file or directory from filesystem
 func (m *Mega) Delete(node *Node, destroy bool) error {
-	if node == nil {
+	return m.DeleteContext(context.Background(), node, destroy)
+}
+
+func (m *Mega) DeleteContext(ctx context.Context, node *Node, destroy bool) error {
+	if node == nil || node.fs != m.FS {
 		return EARGS
 	}
 	if !destroy {
 		return m.Move(node, m.FS.trash)
 	}
 
-	m.FS.mutex.Lock()
-	defer m.FS.mutex.Unlock()
-
 	var msg [1]FileDeleteMsg
 	var err error
 	msg[0].Cmd = "d"
-	msg[0].N = node.hash
+	msg[0].N = node.GetHash()
 	msg[0].I, err = randString(10)
 	if err != nil {
 		return err
@@ -1918,15 +1670,25 @@ func (m *Mega) Delete(node *Node, destroy bool) error {
 	if err != nil {
 		return err
 	}
-	_, err = m.api_request(req)
+	_, err = m.apiRequest(ctx, req, "")
 	if err != nil {
 		return err
 	}
 
+	m.FS.mutex.Lock()
+	defer m.FS.mutex.Unlock()
 	if node.parent != nil {
 		node.parent.removeChild(node)
 	}
-	delete(m.FS.lookup, node.hash)
+	var forget func(*Node)
+	forget = func(n *Node) {
+		for _, child := range n.children {
+			forget(child)
+		}
+		delete(m.FS.lookup, n.hash)
+		delete(m.FS.skmap, n.hash)
+	}
+	forget(node)
 
 	return nil
 }
@@ -2162,18 +1924,14 @@ func (m *Mega) getLink(n *Node) (string, error) {
 
 // Exports public link for node, with or without decryption key included
 func (m *Mega) Link(n *Node, includeKey bool) (string, error) {
-	id, err := m.getLink(n)
+	link, err := m.ExportContext(context.Background(), n)
 	if err != nil {
 		return "", err
 	}
-	if includeKey {
-		m.FS.mutex.Lock()
-		key := base64urlencode(n.meta.compkey)
-		m.FS.mutex.Unlock()
-		return fmt.Sprintf("%v/#!%v!%v", BASE_DOWNLOAD_URL, id, key), nil
-	} else {
-		return fmt.Sprintf("%v/#!%v", BASE_DOWNLOAD_URL, id), nil
+	if !includeKey {
+		link, _, _ = strings.Cut(link, "#")
 	}
+	return link, nil
 }
 
 // addRequestHeaders adds standard headers to a request

@@ -54,6 +54,7 @@ type QuotaMsg struct {
 	Xfer int `json:"xfer"`
 	// Without strg=1 only reports total capacity for account
 	Strg int `json:"strg,omitempty"`
+	Pro  int `json:"pro,omitempty"`
 }
 
 type QuotaResp struct {
@@ -62,7 +63,12 @@ type QuotaResp struct {
 	// Cstrg is used capacity in bytes
 	Cstrg uint64 `json:"cstrg"`
 	// Per folder usage in bytes?
-	Cstrgn map[string][]int64 `json:"cstrgn"`
+	Cstrgn     map[string][]int64 `json:"cstrgn"`
+	Mxfer      uint64             `json:"mxfer"`
+	Caxfer     uint64             `json:"caxfer"`
+	Csxfer     uint64             `json:"csxfer"`
+	ProLevel   int                `json:"utype"`
+	ProExpires int64              `json:"suntil"`
 }
 
 type FilesMsg struct {
