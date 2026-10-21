@@ -1104,58 +1104,100 @@ func (d *Download) DownloadChunkContext(ctx context.Context, id int) (chunk []by
 		return nil, err
 	}
 
-	d.urlMu.Lock()
-	chunkURL := fmt.Sprintf("%s/%d-%d", d.resourceUrl, chk_start, chk_start+int64(chk_size)-1)
-	d.urlMu.Unlock()
-	chunk, err = d.m.transferRequest(ctx, "GET", chunkURL, nil, int64(chk_size), true)
+	stale := d.url()
+	chunk, err = d.m.transferRequest(ctx, "GET", rangeURL(stale, chk_start, chk_start+int64(chk_size)), nil, int64(chk_size), true)
 	if errors.Is(err, EEXPIRED) {
-		d.urlMu.Lock()
-		fresh, refreshErr := d.m.NewDownloadContext(ctx, d.src)
-		if refreshErr == nil {
-			d.resourceUrl = fresh.resourceUrl
-		}
-		chunkURL = fmt.Sprintf("%s/%d-%d", d.resourceUrl, chk_start, chk_start+int64(chk_size)-1)
-		d.urlMu.Unlock()
+		fresh, refreshErr := d.refreshURL(ctx, stale)
 		if refreshErr != nil {
 			return nil, refreshErr
 		}
-		chunk, err = d.m.transferRequest(ctx, "GET", chunkURL, nil, int64(chk_size), true)
+		chunk, err = d.m.transferRequest(ctx, "GET", rangeURL(fresh, chk_start, chk_start+int64(chk_size)), nil, int64(chk_size), true)
 	}
 	if err != nil {
 		return nil, err
 	}
+	if err = d.verifyChunk(id, chunk, make([]byte, macScratch)); err != nil {
+		return nil, err
+	}
+	return chunk, nil
+}
 
-	// Decrypt the block
+// rangeURL addresses the half-open byte range [start, end).
+func rangeURL(base string, start, end int64) string {
+	return fmt.Sprintf("%s/%d-%d", base, start, end-1)
+}
+
+func (d *Download) url() string {
+	d.urlMu.Lock()
+	defer d.urlMu.Unlock()
+	return d.resourceUrl
+}
+
+// refreshURL replaces an expired transfer URL once; workers that saw the same
+// stale URL wait for that refresh instead of issuing their own API call.
+func (d *Download) refreshURL(ctx context.Context, stale string) (string, error) {
+	d.urlMu.Lock()
+	defer d.urlMu.Unlock()
+	if d.resourceUrl != stale {
+		return d.resourceUrl, nil
+	}
+	fresh, err := d.m.NewDownloadContext(ctx, d.src)
+	if err != nil {
+		return "", err
+	}
+	d.resourceUrl = fresh.resourceUrl
+	return d.resourceUrl, nil
+}
+
+// macScratch bounds the CBC-MAC scratch buffer; MACs are chained across pieces.
+const macScratch = 64 << 10
+
+// verifyChunk decrypts chunk id in place and records its CBC-MAC. scratch must
+// hold at least 16 bytes; larger buffers mean fewer CryptBlocks calls.
+func (d *Download) verifyChunk(id int, chunk, scratch []byte) error {
+	chk_start, chk_size, err := d.ChunkLocation(id)
+	if err != nil {
+		return err
+	}
+	if len(chunk) != chk_size {
+		return EBADRESP
+	}
 	ctr_iv, err := bytes_to_a32(d.src.meta.iv)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	ctr_iv[2] = uint32(uint64(chk_start) / 0x1000000000)
 	ctr_iv[3] = uint32(chk_start / 0x10)
 	bctr_iv, err := a32_to_bytes(ctr_iv)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	ctr_aes := cipher.NewCTR(d.aes_block, bctr_iv)
-	ctr_aes.XORKeyStream(chunk, chunk)
+	cipher.NewCTR(d.aes_block, bctr_iv).XORKeyStream(chunk, chunk)
 
-	// Update the chunk_macs
+	// CBC-MAC over the plaintext, zero padded to a block. The encrypter carries
+	// its chaining state between calls, so pieces give the same result.
+	scratch = scratch[:len(scratch)&^15]
 	enc := cipher.NewCBCEncrypter(d.aes_block, d.iv)
-	i := 0
-	block := make([]byte, 16)
-	paddedChunk := paddnull(chunk, 16)
-	for i = 0; i < len(paddedChunk); i += 16 {
-		enc.CryptBlocks(block, paddedChunk[i:i+16])
+	whole := len(chunk) &^ 15
+	last := make([]byte, 16)
+	for p := 0; p < whole; {
+		n := min(len(scratch), whole-p)
+		enc.CryptBlocks(scratch[:n], chunk[p:p+n])
+		copy(last, scratch[n-16:n])
+		p += n
+	}
+	if tail := chunk[whole:]; len(tail) > 0 {
+		pad := make([]byte, 16)
+		copy(pad, tail)
+		enc.CryptBlocks(last, pad)
 	}
 
 	d.mutex.Lock()
 	if len(d.chunk_macs) > 0 {
-		d.chunk_macs[id] = make([]byte, 16)
-		copy(d.chunk_macs[id], block)
+		d.chunk_macs[id] = last
 	}
 	d.mutex.Unlock()
-
-	return chunk, nil
+	return nil
 }
 
 // Finish checks the accumulated MAC for each block.

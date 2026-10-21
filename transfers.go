@@ -94,6 +94,126 @@ func runChunks(ctx context.Context, count, workers int, fn func(context.Context,
 	return ctx.Err()
 }
 
+// maxSpan matches the MEGA SDK's desktop MAX_REQ_SIZE: one GET streams many
+// MAC chunks, so a request round-trip is paid per 16 MiB instead of per 1 MiB.
+const maxSpan = 16 << 20
+
+// chunkSpan is the inclusive chunk-id range [first, last] fetched by one GET.
+type chunkSpan struct{ first, last int }
+
+// spans groups chunks so every worker gets work: about two spans per worker,
+// each between one chunk and maxSpan bytes.
+func spans(chunks []chunkSize, workers int) []chunkSpan {
+	var total int64
+	for _, c := range chunks {
+		total += int64(c.size)
+	}
+	target := min(max(total/int64(2*max(workers, 1)), 1<<20), maxSpan)
+	var out []chunkSpan
+	for i := 0; i < len(chunks); {
+		j, size := i, int64(chunks[i].size)
+		for j+1 < len(chunks) && size+int64(chunks[j+1].size) <= target {
+			j++
+			size += int64(chunks[j].size)
+		}
+		out = append(out, chunkSpan{i, j})
+		i = j + 1
+	}
+	return out
+}
+
+// stallReader cancels its request when no bytes arrive within the timeout,
+// which replaces a whole-request deadline that would kill large spans.
+type stallReader struct {
+	io.Reader
+	timer   *time.Timer
+	timeout time.Duration
+}
+
+func (r stallReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if n > 0 {
+		r.timer.Reset(r.timeout)
+	}
+	return n, err
+}
+
+var errStalled = fmt.Errorf("MEGA transfer stalled: %w", io.ErrUnexpectedEOF)
+
+// streamSpan fetches chunks *next..last in one GET, verifying and writing each
+// chunk as it arrives. *next advances past every chunk that was written, so a
+// retry resumes at the first missing chunk.
+func (d *Download) streamSpan(ctx context.Context, next *int, last int, buf, scratch []byte, write func(int, []byte) error) error {
+	start, _, err := d.ChunkLocation(*next)
+	if err != nil {
+		return err
+	}
+	end, size, err := d.ChunkLocation(last)
+	if err != nil {
+		return err
+	}
+	base := d.url()
+	resp, cancel, err := d.m.openTransfer(ctx, rangeURL(base, start, end+int64(size)))
+	if errors.Is(err, EEXPIRED) {
+		if base, err = d.refreshURL(ctx, base); err == nil {
+			resp, cancel, err = d.m.openTransfer(ctx, rangeURL(base, start, end+int64(size)))
+		}
+	}
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	defer resp.Body.Close()
+	timeout := d.m.config.timeout
+	body := stallReader{resp.Body, time.AfterFunc(timeout, cancel), timeout}
+	defer body.timer.Stop()
+	for ; *next <= last; *next++ {
+		_, size, _ := d.ChunkLocation(*next)
+		chunk := buf[:size]
+		if _, err = io.ReadFull(body, chunk); err != nil {
+			if ctx.Err() == nil && errors.Is(err, context.Canceled) {
+				return errStalled
+			}
+			return transportError(err)
+		}
+		if err = d.verifyChunk(*next, chunk, scratch); err != nil {
+			return err
+		}
+		if err = write(*next, chunk); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// downloadSpan retries streamSpan; any verified progress resets the retry budget.
+func (d *Download) downloadSpan(ctx context.Context, s chunkSpan, buf, scratch []byte, write func(int, []byte) error) error {
+	next := s.first
+	var last error
+	for attempt := 0; attempt <= d.m.retries; attempt++ {
+		if attempt > 0 {
+			if err := waitRetry(ctx, attempt); err != nil {
+				return err
+			}
+		}
+		before := next
+		last = d.streamSpan(ctx, &next, s.last, buf, scratch, write)
+		if last == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !retryable(last) {
+			return last
+		}
+		if next > before {
+			attempt = 0
+		}
+	}
+	return last
+}
+
 func (m *Mega) downloadNode(ctx context.Context, node *Node, destination string, onBytes func(int64)) error {
 	d, err := m.NewDownloadContext(ctx, node)
 	if err != nil {
@@ -104,11 +224,7 @@ func (m *Mega) downloadNode(ctx context.Context, node *Node, destination string,
 		return err
 	}
 	defer f.Close()
-	err = runChunks(ctx, d.Chunks(), m.dl_workers, func(ctx context.Context, id int) error {
-		data, err := d.DownloadChunkContext(ctx, id)
-		if err != nil {
-			return err
-		}
+	write := func(id int, data []byte) error {
 		position, _, err := d.ChunkLocation(id)
 		if err != nil {
 			return err
@@ -124,6 +240,11 @@ func (m *Mega) downloadNode(ctx context.Context, node *Node, destination string,
 			onBytes(int64(n))
 		}
 		return nil
+	}
+	work := spans(d.chunks, m.dl_workers)
+	err = runChunks(ctx, len(work), m.dl_workers, func(ctx context.Context, id int) error {
+		// ponytail: per-span buffers; pool them if GC shows up in profiles.
+		return d.downloadSpan(ctx, work[id], make([]byte, 1<<20), make([]byte, macScratch), write)
 	})
 	if err != nil {
 		return err

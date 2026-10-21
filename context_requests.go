@@ -271,6 +271,37 @@ func (m *Mega) transferRequest(ctx context.Context, method, endpoint string, bod
 	return nil, last
 }
 
+// openTransfer starts one streamed GET. The caller owns the body and cancel and
+// bounds stalls itself; the client's whole-request Timeout does not apply here.
+func (m *Mega) openTransfer(ctx context.Context, endpoint string) (*http.Response, context.CancelFunc, error) {
+	if err := validateTransferURL(endpoint); err != nil {
+		return nil, nil, err
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+	if err != nil {
+		cancel()
+		return nil, nil, EARGS
+	}
+	resp, err := (&http.Client{Transport: m.client.Transport}).Do(req)
+	if err != nil {
+		cancel()
+		return nil, nil, transportError(err)
+	}
+	if resp.StatusCode == 200 || resp.StatusCode == 206 {
+		return resp, cancel, nil
+	}
+	resp.Body.Close()
+	cancel()
+	switch resp.StatusCode {
+	case 509:
+		return nil, nil, EOVERQUOTA
+	case 403, 404, 410:
+		return nil, nil, EEXPIRED
+	}
+	return nil, nil, &HTTPError{resp.StatusCode}
+}
+
 // LoginContext authenticates without fetching a filesystem or starting event pollers.
 // Authenticate once before sharing the client between concurrent operations.
 func (m *Mega) LoginContext(ctx context.Context, email, password string) error {
