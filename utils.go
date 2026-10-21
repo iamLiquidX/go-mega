@@ -22,7 +22,9 @@ func newHttpClient(timeout time.Duration) *http.Client {
 	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
 	return &http.Client{Timeout: timeout, Transport: &http.Transport{
 		Proxy: http.ProxyFromEnvironment, DialContext: dialer.DialContext,
-		ForceAttemptHTTP2: true, MaxIdleConns: 64, MaxIdleConnsPerHost: 32,
+		// HTTP/1.1 keeps one TCP connection per transfer worker; HTTP/2 would
+		// multiplex every worker onto a single congestion window.
+		MaxIdleConns: 64, MaxIdleConnsPerHost: 32,
 		IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: timeout,
 		ResponseHeaderTimeout: timeout,
 	}}
