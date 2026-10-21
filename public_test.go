@@ -414,6 +414,25 @@ func TestPublicFolderBatchFailureFallsBackPerFile(t *testing.T) {
 	}
 }
 
+func TestUnavailableFolderLink(t *testing.T) {
+	for body, want := range map[string]error{
+		`-9`:           ENOENT,
+		`[{"f":[]}]`:   ENOENT,
+		`[{"err":-6}]`: ETOOMANY,
+		`[{"e":-16}]`:  EBLOCKED,
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(body)) }))
+		m := New()
+		m.SetAPIUrl(server.URL)
+		_, err := m.ResolvePublic(context.Background(), "https://mega.nz/folder/AAAAAAAB#"+base64urlencode([]byte("folder-share-key")))
+		m.Close()
+		server.Close()
+		if !errors.Is(err, want) {
+			t.Errorf("%s: err = %v, want %v", body, err, want)
+		}
+	}
+}
+
 func TestPublicFolderTree(t *testing.T) {
 	share := []byte("folder-share-key")
 	folderKey := []byte("folder-node-key!")

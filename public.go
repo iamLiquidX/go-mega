@@ -188,8 +188,21 @@ func (m *Mega) ResolvePublic(ctx context.Context, raw string) (*PublicResource, 
 			return nil, err
 		}
 		var response [1]FilesResp
-		if json.Unmarshal(body, &response) != nil || len(response[0].F) == 0 {
+		if json.Unmarshal(body, &response) != nil {
 			return nil, EBADRESP
+		}
+		if len(response[0].F) == 0 {
+			// A folder link with no nodes is gone; prefer an explicit error code.
+			var coded [1]struct {
+				E   ErrorMsg `json:"e"`
+				Err ErrorMsg `json:"err"`
+			}
+			if json.Unmarshal(body, &coded) == nil {
+				if code := min(coded[0].E, coded[0].Err); code < 0 {
+					return nil, parseError(code)
+				}
+			}
+			return nil, ENOENT
 		}
 		block, _ := aes.NewCipher(link.key)
 		parents := make(map[string]string, len(response[0].F))
