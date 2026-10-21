@@ -70,18 +70,30 @@ func waitRetry(ctx context.Context, attempt int) error {
 // apiRequest serializes API sequence IDs while allowing queued callers to cancel.
 // folder is a public-folder handle; sid always remains the account session.
 func (m *Mega) apiRequest(ctx context.Context, body []byte, folder string) ([]byte, error) {
+	data, _, err := m.apiCall(ctx, body, folder, 1)
+	return data, err
+}
+
+// apiBatch sends n commands in one request and returns one raw result per
+// command. Per-command error codes are left to the caller.
+func (m *Mega) apiBatch(ctx context.Context, body []byte, folder string, n int) ([]json.RawMessage, error) {
+	_, values, err := m.apiCall(ctx, body, folder, n)
+	return values, err
+}
+
+func (m *Mega) apiCall(ctx context.Context, body []byte, folder string, n int) ([]byte, []json.RawMessage, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	select {
 	case m.apiGate <- struct{}{}:
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, nil, ctx.Err()
 	}
 	defer func() { m.sn++; <-m.apiGate }()
 	endpoint, err := url.Parse(m.baseurl + "/cs")
 	if err != nil {
-		return nil, EARGS
+		return nil, nil, EARGS
 	}
 	q := endpoint.Query()
 	q.Set("id", strconv.FormatInt(m.sn, 10))
@@ -96,16 +108,16 @@ func (m *Mega) apiRequest(ctx context.Context, body []byte, folder string) ([]by
 	var token, cash string
 	for attempt := 0; attempt <= m.retries; attempt++ {
 		if err = ctx.Err(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if attempt > 0 {
 			if err = waitRetry(ctx, attempt); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 		req, err := http.NewRequestWithContext(ctx, "POST", endpoint.String(), bytes.NewReader(body))
 		if err != nil {
-			return nil, EARGS
+			return nil, nil, EARGS
 		}
 		req.Header.Set("Content-Type", "application/json")
 		addRequestHeaders(req)
@@ -116,7 +128,7 @@ func (m *Mega) apiRequest(ctx context.Context, body []byte, folder string) ([]by
 		if err != nil {
 			last = transportError(err)
 			if ctx.Err() != nil {
-				return nil, ctx.Err()
+				return nil, nil, ctx.Err()
 			}
 			continue
 		}
@@ -125,11 +137,11 @@ func (m *Mega) apiRequest(ctx context.Context, body []byte, folder string) ([]by
 			resp.Body.Close()
 			ease, t, ok := parseHashcash(challenge)
 			if !ok {
-				return nil, EBADRESP
+				return nil, nil, EBADRESP
 			}
 			cash, err = solveHashCashChallengeContext(ctx, t, ease, HASHCASH_CHALLENGE_TIMEOUT, 1)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			token = t
 			last = &HTTPError{402}
@@ -139,7 +151,7 @@ func (m *Mega) apiRequest(ctx context.Context, body []byte, folder string) ([]by
 			resp.Body.Close()
 			last = &HTTPError{resp.StatusCode}
 			if !retryable(last) {
-				return nil, last
+				return nil, nil, last
 			}
 			continue
 		}
@@ -148,7 +160,7 @@ func (m *Mega) apiRequest(ctx context.Context, body []byte, folder string) ([]by
 		if readErr != nil {
 			last = transportError(readErr)
 			if errors.Is(last, EBADRESP) {
-				return nil, last
+				return nil, nil, last
 			}
 			continue
 		}
@@ -157,34 +169,34 @@ func (m *Mega) apiRequest(ctx context.Context, body []byte, folder string) ([]by
 			continue
 		}
 		if len(data) > 64<<20 {
-			return nil, EBADRESP
+			return nil, nil, EBADRESP
 		}
 		var values []json.RawMessage
-		if json.Unmarshal(data, &values) != nil || len(values) != 1 {
+		if json.Unmarshal(data, &values) != nil || len(values) != n {
 			var code ErrorMsg
 			if json.Unmarshal(data, &code) == nil && code < 0 {
 				last = parseError(code)
 				if retryable(last) {
 					continue
 				}
-				return nil, last
+				return nil, nil, last
 			}
-			return nil, EBADRESP
+			return nil, nil, EBADRESP
 		}
 		var code ErrorMsg
-		if json.Unmarshal(values[0], &code) == nil && code < 0 {
+		if n == 1 && json.Unmarshal(values[0], &code) == nil && code < 0 {
 			last = parseError(code)
 			if retryable(last) {
 				continue
 			}
-			return nil, last
+			return nil, nil, last
 		}
-		return data, nil
+		return data, values, nil
 	}
 	if last == nil {
 		last = EBADRESP
 	}
-	return nil, last
+	return nil, nil, last
 }
 
 // transferRequest bounds reads, retries short/interrupted bodies, and never logs URLs.

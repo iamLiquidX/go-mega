@@ -312,7 +312,10 @@ func TestConcurrentPublicDownloads(t *testing.T) {
 	wg.Wait()
 }
 
-func TestPublicFolderFilesOverlap(t *testing.T) {
+// folderFixture serves a public folder of count identical small files. Batched
+// "g" commands get one result each; the file named missing resolves to -9.
+// Each content GET sleeps briefly so concurrency is observable.
+func folderFixture(t *testing.T, count int, missing string) (link string, gSizes *[]int, maxInflight *atomic.Int32) {
 	share := []byte("folder-share-key")
 	block, _ := aes.NewCipher(share)
 	data := []byte("parallel file")
@@ -325,22 +328,21 @@ func TestPublicFolderFilesOverlap(t *testing.T) {
 	}
 	folderKey := []byte("folder-node-key!")
 	nodes := []FSNode{{Hash: "AAAAAAAB", T: FOLDER, Key: wrap(folderKey), Attr: fixtureAttr(folderKey, "bundle")}}
-	for _, h := range []string{"AAAAAAAC", "AAAAAAAD", "AAAAAAAE", "AAAAAAAF"} {
+	for i := 0; i < count; i++ {
+		h := fmt.Sprintf("AAAA%04d", i)
 		nodes = append(nodes, FSNode{Hash: h, Parent: "AAAAAAAB", T: FILE, Sz: int64(len(data)), Key: wrap(key), Attr: fixtureAttr(meta.key, h+".bin")})
 	}
-	// Each content request waits until parallelFiles requests are in flight.
+	var mu sync.Mutex
+	gSizes = new([]int)
+	maxInflight = new(atomic.Int32)
 	var inflight atomic.Int32
-	all := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/cs" {
-			if inflight.Add(1) == parallelFiles {
-				close(all)
+			now := inflight.Add(1)
+			for seen := maxInflight.Load(); now > seen && !maxInflight.CompareAndSwap(seen, now); seen = maxInflight.Load() {
 			}
-			select {
-			case <-all:
-			case <-time.After(3 * time.Second):
-				t.Error("folder files did not overlap")
-			}
+			time.Sleep(20 * time.Millisecond)
+			inflight.Add(-1)
 			w.Write(encrypted)
 			return
 		}
@@ -348,20 +350,67 @@ func TestPublicFolderFilesOverlap(t *testing.T) {
 		json.NewDecoder(r.Body).Decode(&request)
 		if request[0]["a"] == "f" {
 			json.NewEncoder(w).Encode([]FilesResp{{F: nodes}})
-		} else {
-			json.NewEncoder(w).Encode([]any{map[string]any{"s": len(data), "g": "http://" + r.Host + "/content"}})
+			return
 		}
+		mu.Lock()
+		*gSizes = append(*gSizes, len(request))
+		mu.Unlock()
+		var out []any
+		for _, cmd := range request {
+			if cmd["n"] == missing {
+				out = append(out, -9)
+			} else {
+				out = append(out, map[string]any{"s": len(data), "g": "http://" + r.Host + "/content"})
+			}
+		}
+		json.NewEncoder(w).Encode(out)
 	}))
-	defer server.Close()
+	t.Cleanup(server.Close)
+	return server.URL + "|https://mega.nz/folder/AAAAAAAB#" + base64urlencode(share), gSizes, maxInflight
+}
+
+func downloadFixture(t *testing.T, fixture string, workers int) (string, error) {
+	api, link, _ := strings.Cut(fixture, "|")
 	m := New()
 	defer m.Close()
-	m.SetAPIUrl(server.URL)
-	result, err := m.DownloadPublic(context.Background(), "https://mega.nz/folder/AAAAAAAB#"+base64urlencode(share), t.TempDir(), nil)
+	m.SetAPIUrl(api)
+	m.SetDownloadWorkers(workers)
+	result, err := m.DownloadPublic(context.Background(), link, t.TempDir(), nil)
+	return result.Path, err
+}
+
+func TestPublicFolderBatchesURLsAndBoundsConnections(t *testing.T) {
+	fixture, gSizes, maxInflight := folderFixture(t, 120, "")
+	path, err := downloadFixture(t, fixture, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if entries, _ := os.ReadDir(result.Path); len(entries) != 4 {
+	if entries, _ := os.ReadDir(path); len(entries) != 120 {
 		t.Fatalf("got %d files", len(entries))
+	}
+	if len(*gSizes) != 3 || (*gSizes)[0] != resolveBatch {
+		t.Fatalf("URL requests %v, want three batches", *gSizes)
+	}
+	// Two workers give four shared slots; parallel files must fill, not exceed, them.
+	if got := maxInflight.Load(); got != 4 {
+		t.Fatalf("max in-flight GETs %d, want 4", got)
+	}
+}
+
+func TestPublicFolderBatchFailureFallsBackPerFile(t *testing.T) {
+	fixture, gSizes, _ := folderFixture(t, 10, "AAAA0004")
+	_, err := downloadFixture(t, fixture, 2)
+	if !errors.Is(err, ENOENT) {
+		t.Fatalf("err = %v, want ENOENT", err)
+	}
+	single := 0
+	for _, n := range *gSizes {
+		if n == 1 {
+			single++
+		}
+	}
+	if single == 0 {
+		t.Fatalf("failed batch entry was not retried alone: %v", *gSizes)
 	}
 }
 

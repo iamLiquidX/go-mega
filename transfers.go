@@ -109,7 +109,10 @@ func runChunks(ctx context.Context, count, workers int, fn func(context.Context,
 
 // parallelFiles bounds concurrent files in a folder download; each file still
 // uses the client's download workers.
-const parallelFiles = 3
+const parallelFiles = 8
+
+// resolveBatch is how many folder files get download URLs per API request.
+const resolveBatch = 50
 
 // maxSpan matches the MEGA SDK's desktop MAX_REQ_SIZE: one GET streams many
 // MAC chunks, so a request round-trip is paid per 16 MiB instead of per 1 MiB.
@@ -231,10 +234,14 @@ func (d *Download) downloadSpan(ctx context.Context, s chunkSpan, buf, scratch [
 	return last
 }
 
-func (m *Mega) downloadNode(ctx context.Context, node *Node, destination string, onBytes func(int64)) error {
-	d, err := m.NewDownloadContext(ctx, node)
-	if err != nil {
-		return err
+// downloadNode downloads node to destination. d may be pre-resolved (nil means
+// resolve now). slots, when set, bounds span GETs shared across files.
+func (m *Mega) downloadNode(ctx context.Context, node *Node, d *Download, slots chan struct{}, destination string, onBytes func(int64)) error {
+	var err error
+	if d == nil {
+		if d, err = m.NewDownloadContext(ctx, node); err != nil {
+			return err
+		}
 	}
 	f, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
 	if err != nil {
@@ -260,6 +267,14 @@ func (m *Mega) downloadNode(ctx context.Context, node *Node, destination string,
 	}
 	work := spans(d.chunks, m.dl_workers)
 	err = runChunks(ctx, len(work), m.dl_workers, func(ctx context.Context, id int) error {
+		if slots != nil {
+			select {
+			case slots <- struct{}{}:
+				defer func() { <-slots }()
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 		// ponytail: per-span buffers; pool them if GC shows up in profiles.
 		return d.downloadSpan(ctx, work[id], make([]byte, 1<<20), make([]byte, macScratch), write)
 	})
@@ -332,10 +347,29 @@ func (r *PublicResource) Download(ctx context.Context, destination string, progr
 			return TransferResult{}, fmt.Errorf("MEGA download: %w", err)
 		}
 	}
-	// Small files never fill the chunk workers, so a few files run at once.
+	// Small files never fill the chunk workers, so several run at once. Span
+	// GETs share 2*dl_workers slots, and URLs are resolved in batches.
+	m := r.client
+	slots := make(chan struct{}, 2*m.dl_workers)
+	var resolveMu sync.Mutex
+	resolved := make([]*Download, len(files))
+	next := 0
 	err = runChunks(ctx, len(files), parallelFiles, func(ctx context.Context, id int) error {
+		resolveMu.Lock()
+		for id >= next {
+			end := min(next+resolveBatch, len(files))
+			batch := make([]*Node, 0, end-next)
+			for _, i := range files[next:end] {
+				batch = append(batch, r.nodes[i])
+			}
+			copy(resolved[next:end], m.newDownloads(ctx, batch))
+			next = end
+		}
+		d := resolved[id]
+		resolved[id] = nil
+		resolveMu.Unlock()
 		i := files[id]
-		return r.client.downloadNode(ctx, r.nodes[i], filepath.Join(staging, filepath.FromSlash(r.entries[i].Path)), reporter.add)
+		return m.downloadNode(ctx, r.nodes[i], d, slots, filepath.Join(staging, filepath.FromSlash(r.entries[i].Path)), reporter.add)
 	})
 	if err != nil {
 		return TransferResult{}, fmt.Errorf("MEGA download: %w", err)
@@ -382,7 +416,7 @@ func (m *Mega) DownloadFileContext(ctx context.Context, node *Node, destination 
 	f.Close()
 	os.Remove(name)
 	defer os.Remove(name)
-	if err = m.downloadNode(ctx, node, name, onBytes); err != nil {
+	if err = m.downloadNode(ctx, node, nil, nil, name, onBytes); err != nil {
 		return err
 	}
 	if err = ctx.Err(); err != nil {

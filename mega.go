@@ -985,25 +985,8 @@ func (m *Mega) NewDownloadContext(ctx context.Context, src *Node) (*Download, er
 	if src == nil || src.GetType() != FILE || src.GetSize() < 0 {
 		return nil, EARGS
 	}
-
-	var msg [1]DownloadMsg
-	var res [1]DownloadResp
-
-	m.FS.mutex.Lock()
-	msg[0].Cmd = "g"
-	msg[0].G = 1
-	if src.publicHandle != "" {
-		msg[0].P = src.publicHandle
-	} else {
-		msg[0].N = src.hash
-	}
-	if m.config.https || src.publicHandle != "" || src.folderHandle != "" {
-		msg[0].SSL = 2
-	}
-	key := src.meta.key
-	m.FS.mutex.Unlock()
-
-	request, err := json.Marshal(msg)
+	msg, key := m.downloadMsg(src)
+	request, err := json.Marshal([1]DownloadMsg{msg})
 	if err != nil {
 		return nil, err
 	}
@@ -1011,33 +994,81 @@ func (m *Mega) NewDownloadContext(ctx context.Context, src *Node) (*Download, er
 	if err != nil {
 		return nil, err
 	}
-
-	err = json.Unmarshal(result, &res)
-	if err != nil {
+	var res [1]DownloadResp
+	if err = json.Unmarshal(result, &res); err != nil {
 		return nil, err
 	}
+	return m.newDownload(src, key, res[0])
+}
 
-	// DownloadResp has an embedded error in it for some reason
-	if res[0].Err != 0 {
-		return nil, parseError(res[0].Err)
+// downloadMsg builds the "g" request for src and snapshots its key.
+func (m *Mega) downloadMsg(src *Node) (DownloadMsg, []byte) {
+	m.FS.mutex.Lock()
+	defer m.FS.mutex.Unlock()
+	msg := DownloadMsg{Cmd: "g", G: 1}
+	if src.publicHandle != "" {
+		msg.P = src.publicHandle
+	} else {
+		msg.N = src.hash
 	}
+	if m.config.https || src.publicHandle != "" || src.folderHandle != "" {
+		msg.SSL = 2
+	}
+	return msg, src.meta.key
+}
 
-	if res[0].Size > uint64(^uint64(0)>>1) || int64(res[0].Size) != src.size {
+// newDownloads resolves many files in one API request. Entries that fail are
+// nil; callers fall back to NewDownloadContext, which retries and maps errors.
+// All nodes must share one folder handle.
+func (m *Mega) newDownloads(ctx context.Context, nodes []*Node) []*Download {
+	out := make([]*Download, len(nodes))
+	msgs := make([]DownloadMsg, len(nodes))
+	keys := make([][]byte, len(nodes))
+	for i, n := range nodes {
+		if n.folderHandle != nodes[0].folderHandle {
+			return out
+		}
+		msgs[i], keys[i] = m.downloadMsg(n)
+	}
+	request, err := json.Marshal(msgs)
+	if err != nil {
+		return out
+	}
+	values, err := m.apiBatch(ctx, request, nodes[0].folderHandle, len(nodes))
+	if err != nil {
+		return out
+	}
+	for i, raw := range values {
+		var res DownloadResp
+		if json.Unmarshal(raw, &res) == nil {
+			out[i], _ = m.newDownload(nodes[i], keys[i], res)
+		}
+	}
+	return out
+}
+
+func (m *Mega) newDownload(src *Node, key []byte, res DownloadResp) (*Download, error) {
+	// DownloadResp has an embedded error in it for some reason
+	if res.Err != 0 {
+		return nil, parseError(res.Err)
+	}
+	if res.Size > uint64(^uint64(0)>>1) || int64(res.Size) != src.size {
 		return nil, EBADRESP
 	}
-	if res[0].Attr != "" {
-		if _, err = decryptAttr(key, res[0].Attr); err != nil {
+	var err error
+	if res.Attr != "" {
+		if _, err = decryptAttr(key, res.Attr); err != nil {
 			return nil, err
 		}
 	}
-	if len(src.meta.iv) != 16 || len(src.meta.mac) != 8 || res[0].G == "" {
+	if len(src.meta.iv) != 16 || len(src.meta.mac) != 8 || res.G == "" {
 		return nil, EBADRESP
 	}
-	if err = validateTransferURL(res[0].G); err != nil {
+	if err = validateTransferURL(res.G); err != nil {
 		return nil, err
 	}
 
-	chunks := getChunkSizes(int64(res[0].Size))
+	chunks := getChunkSizes(int64(res.Size))
 
 	aes_block, err := aes.NewCipher(key)
 	if err != nil {
@@ -1056,7 +1087,7 @@ func (m *Mega) NewDownloadContext(ctx context.Context, src *Node) (*Download, er
 		return nil, err
 	}
 
-	downloadUrl := res[0].G
+	downloadUrl := res.G
 	if m.config.https && strings.HasPrefix(downloadUrl, "http://") {
 		downloadUrl = "https://" + strings.TrimPrefix(downloadUrl, "http://")
 	}
