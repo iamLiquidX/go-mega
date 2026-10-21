@@ -312,6 +312,59 @@ func TestConcurrentPublicDownloads(t *testing.T) {
 	wg.Wait()
 }
 
+func TestPublicFolderFilesOverlap(t *testing.T) {
+	share := []byte("folder-share-key")
+	block, _ := aes.NewCipher(share)
+	data := []byte("parallel file")
+	key, encrypted := fixtureFile(data)
+	meta, _ := fileMeta(key)
+	wrap := func(k []byte) string {
+		wrapped := make([]byte, len(k))
+		blockEncrypt(block, wrapped, k)
+		return "AAAAAAAB:" + base64urlencode(wrapped)
+	}
+	folderKey := []byte("folder-node-key!")
+	nodes := []FSNode{{Hash: "AAAAAAAB", T: FOLDER, Key: wrap(folderKey), Attr: fixtureAttr(folderKey, "bundle")}}
+	for _, h := range []string{"AAAAAAAC", "AAAAAAAD", "AAAAAAAE", "AAAAAAAF"} {
+		nodes = append(nodes, FSNode{Hash: h, Parent: "AAAAAAAB", T: FILE, Sz: int64(len(data)), Key: wrap(key), Attr: fixtureAttr(meta.key, h+".bin")})
+	}
+	// Each content request waits until parallelFiles requests are in flight.
+	var inflight atomic.Int32
+	all := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/cs" {
+			if inflight.Add(1) == parallelFiles {
+				close(all)
+			}
+			select {
+			case <-all:
+			case <-time.After(3 * time.Second):
+				t.Error("folder files did not overlap")
+			}
+			w.Write(encrypted)
+			return
+		}
+		var request []map[string]any
+		json.NewDecoder(r.Body).Decode(&request)
+		if request[0]["a"] == "f" {
+			json.NewEncoder(w).Encode([]FilesResp{{F: nodes}})
+		} else {
+			json.NewEncoder(w).Encode([]any{map[string]any{"s": len(data), "g": "http://" + r.Host + "/content"}})
+		}
+	}))
+	defer server.Close()
+	m := New()
+	defer m.Close()
+	m.SetAPIUrl(server.URL)
+	result, err := m.DownloadPublic(context.Background(), "https://mega.nz/folder/AAAAAAAB#"+base64urlencode(share), t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entries, _ := os.ReadDir(result.Path); len(entries) != 4 {
+		t.Fatalf("got %d files", len(entries))
+	}
+}
+
 func TestPublicFolderTree(t *testing.T) {
 	share := []byte("folder-share-key")
 	folderKey := []byte("folder-node-key!")

@@ -94,6 +94,10 @@ func runChunks(ctx context.Context, count, workers int, fn func(context.Context,
 	return ctx.Err()
 }
 
+// parallelFiles bounds concurrent files in a folder download; each file still
+// uses the client's download workers.
+const parallelFiles = 3
+
 // maxSpan matches the MEGA SDK's desktop MAX_REQ_SIZE: one GET streams many
 // MAC chunks, so a request round-trip is paid per 16 MiB instead of per 1 MiB.
 const maxSpan = 16 << 20
@@ -306,19 +310,22 @@ func (r *PublicResource) Download(ctx context.Context, destination string, progr
 	defer os.RemoveAll(staging)
 	reporter := &progressReporter{name: r.Name(), total: r.Size(), start: time.Now(), callback: progress}
 	reporter.add(0)
+	// Entries list parents first, so folders exist before any file lands.
+	var files []int
 	for i, entry := range r.entries {
-		if ctx.Err() != nil {
-			return TransferResult{}, ctx.Err()
-		}
-		path := filepath.Join(staging, filepath.FromSlash(entry.Path))
-		if entry.IsFolder {
-			err = os.Mkdir(path, 0700)
-		} else {
-			err = r.client.downloadNode(ctx, r.nodes[i], path, reporter.add)
-		}
-		if err != nil {
+		if !entry.IsFolder {
+			files = append(files, i)
+		} else if err = os.Mkdir(filepath.Join(staging, filepath.FromSlash(entry.Path)), 0700); err != nil {
 			return TransferResult{}, fmt.Errorf("MEGA download: %w", err)
 		}
+	}
+	// Small files never fill the chunk workers, so a few files run at once.
+	err = runChunks(ctx, len(files), parallelFiles, func(ctx context.Context, id int) error {
+		i := files[id]
+		return r.client.downloadNode(ctx, r.nodes[i], filepath.Join(staging, filepath.FromSlash(r.entries[i].Path)), reporter.add)
+	})
+	if err != nil {
+		return TransferResult{}, fmt.Errorf("MEGA download: %w", err)
 	}
 	if err = ctx.Err(); err != nil {
 		return TransferResult{}, err
