@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"net/url"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -127,9 +128,10 @@ type PublicResource struct {
 	nodes   []*Node
 	size    int64
 	folder  string
+	name    string // root's local name; entry paths are local names too
 }
 
-func (r *PublicResource) Name() string     { return r.root.name }
+func (r *PublicResource) Name() string     { return r.name }
 func (r *PublicResource) Size() int64      { return r.size }
 func (r *PublicResource) IsFolder() bool   { return r.root.ntype == FOLDER }
 func (r *PublicResource) Entries() []Entry { return append([]Entry(nil), r.entries...) }
@@ -311,13 +313,14 @@ func (m *Mega) ResolvePublic(ctx context.Context, raw string) (*PublicResource, 
 	return resource, nil
 }
 
+// snapshot records every node under a local name: the MEGA name made safe
+// for Linux and Windows filesystems (see localName), deduplicated within
+// its folder. Only names that are unsafe in themselves - traversal or
+// control characters - fail the link.
 func (r *PublicResource) snapshot() error {
-	var walk func(*Node, string) error
-	walk = func(node *Node, parent string) error {
-		if !safeName(node.name) {
-			return fmt.Errorf("unsafe MEGA filename: %w", EARGS)
-		}
-		relative := node.name
+	var walk func(*Node, string, string) error
+	walk = func(node *Node, name, parent string) error {
+		relative := name
 		if parent != "" {
 			relative = parent + "/" + relative
 		}
@@ -332,18 +335,67 @@ func (r *PublicResource) snapshot() error {
 		sort.Slice(node.children, func(i, j int) bool { return node.children[i].name < node.children[j].name })
 		used := make(map[string]bool)
 		for _, child := range node.children {
-			collision := strings.ToLower(child.name)
-			if used[collision] {
-				return fmt.Errorf("ambiguous MEGA filenames: %w", EEXIST)
+			local, ok := localName(child.name)
+			if !ok {
+				return fmt.Errorf("unsafe MEGA filename: %w", EARGS)
 			}
-			used[collision] = true
-			if err := walk(child, relative); err != nil {
+			if err := walk(child, uniqueName(local, used), relative); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
-	return walk(r.root, "")
+	name, ok := localName(r.root.name)
+	if !ok {
+		return fmt.Errorf("unsafe MEGA filename: %w", EARGS)
+	}
+	r.name = name
+	return walk(r.root, name, "")
+}
+
+// localName maps a MEGA name to one that is safe on Linux and Windows.
+// Traversal ("", ".", "..", "/" or "\") and control characters are refused;
+// anything MEGA allows but Windows can't store is rewritten instead: the
+// characters :*?"<>| become "_", trailing dots and spaces are trimmed and a
+// reserved device stem (CON, NUL, COM1, ...) gets a "_" prefix.
+func localName(name string) (string, bool) {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\\") {
+		return "", false
+	}
+	for _, r := range name {
+		if r < 32 || r == 127 {
+			return "", false
+		}
+	}
+	name = strings.TrimRight(strings.Map(func(r rune) rune {
+		if strings.ContainsRune(`:*?"<>|`, r) {
+			return '_'
+		}
+		return r
+	}, name), ". ")
+	if name == "" {
+		return "_", true
+	}
+	if !safeName(name) {
+		name = "_" + name // only a reserved stem is left to fail safeName
+	}
+	return name, true
+}
+
+// uniqueName returns name, or "stem (n).ext" for the first n >= 2 not yet
+// in used, compared case-insensitively since Windows and macOS are; the
+// result is added to used.
+func uniqueName(name string, used map[string]bool) string {
+	candidate := name
+	ext := path.Ext(name)
+	if ext == name {
+		ext = "" // ".hidden": all stem, no extension
+	}
+	for n := 2; used[strings.ToLower(candidate)]; n++ {
+		candidate = fmt.Sprintf("%s (%d)%s", strings.TrimSuffix(name, ext), n, ext)
+	}
+	used[strings.ToLower(candidate)] = true
+	return candidate
 }
 
 func safeName(name string) bool {

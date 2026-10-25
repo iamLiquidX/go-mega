@@ -505,11 +505,51 @@ func TestPublicFolderTree(t *testing.T) {
 }
 
 func TestSnapshotRejectsUnsafeNames(t *testing.T) {
-	for _, name := range []string{"..", "../escape", "a\\b", "C:escape", "NUL", "file.", ""} {
+	for _, name := range []string{"..", ".", "../escape", "a\\b", "", "bad\x00name", "tab\tname"} {
 		r := &PublicResource{root: &Node{name: name, ntype: FILE}}
 		if err := r.snapshot(); err == nil {
 			t.Fatalf("accepted unsafe name %q", name)
 		}
+	}
+}
+
+// Names MEGA allows but Windows can't store are mapped, not refused, and
+// case-insensitive duplicates within a folder get " (n)" suffixes.
+func TestSnapshotMapsWindowsNames(t *testing.T) {
+	for in, want := range map[string]string{
+		"C:escape":             "C_escape",
+		"NUL":                  "_NUL",
+		"com1.txt":             "_com1.txt",
+		"file.":                "file",
+		"Why?.mp4":             "Why_.mp4",
+		`Ep 1: "Pilot" <HD>|*`: "Ep 1_ _Pilot_ _HD___",
+		"...":                  "_",
+	} {
+		r := &PublicResource{root: &Node{name: in, ntype: FILE}}
+		if err := r.snapshot(); err != nil {
+			t.Fatalf("%q: %v", in, err)
+		}
+		if r.Name() != want || r.entries[0].Path != want {
+			t.Errorf("%q -> name %q path %q, want %q", in, r.Name(), r.entries[0].Path, want)
+		}
+	}
+
+	root := &Node{name: "Show: S1", ntype: FOLDER}
+	for _, name := range []string{"A.mp4", "a.mp4", "a?.mp4", "a:.mp4", ".hidden", ".HIDDEN"} {
+		root.children = append(root.children, &Node{name: name, ntype: FILE})
+	}
+	r := &PublicResource{root: root}
+	if err := r.snapshot(); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, e := range r.entries {
+		got = append(got, e.Path)
+	}
+	want := []string{"Show_ S1", "Show_ S1/.HIDDEN", "Show_ S1/.hidden (2)", "Show_ S1/A.mp4",
+		"Show_ S1/a (2).mp4", "Show_ S1/a_.mp4", "Show_ S1/a_ (2).mp4"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("paths\n got %q\nwant %q", got, want)
 	}
 }
 
