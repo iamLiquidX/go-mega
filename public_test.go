@@ -108,21 +108,11 @@ func TestParsePublicLink(t *testing.T) {
 	}
 }
 
+// fileFixture serves one public file; corrupt flips a bit in the first chunk
+// of every payload request that starts at offset 0.
 func fileFixture(t *testing.T, data []byte, corrupt bool) (*Mega, string, *atomic.Int32) {
 	t.Helper()
-	times := int32(0)
-	if corrupt {
-		times = -1
-	}
-	return corruptingFixture(t, data, times)
-}
-
-// corruptingFixture flips a bit in the first chunk of the first `times`
-// payload requests that start at offset 0; -1 corrupts every one.
-func corruptingFixture(t *testing.T, data []byte, times int32) (*Mega, string, *atomic.Int32) {
-	t.Helper()
 	key, ciphertext := fixtureFile(data)
-	var corrupted atomic.Int32
 	meta, _ := fileMeta(key)
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -137,7 +127,7 @@ func corruptingFixture(t *testing.T, data []byte, times int32) (*Mega, string, *
 		}
 		calls.Add(1)
 		out := append([]byte(nil), ciphertext[first:last+1]...)
-		if first == 0 && (times < 0 || corrupted.Add(1) <= times) {
+		if first == 0 && corrupt {
 			out[0] ^= 1
 		}
 		_, _ = w.Write(out)
@@ -177,34 +167,10 @@ func TestPublicDownloadIntegrity(t *testing.T) {
 	}
 }
 
-// A one-off bad read is re-downloaded instead of failing the task, and the
-// discarded attempt's bytes don't inflate progress.
-func TestTransientCorruptionRetried(t *testing.T) {
-	data := bytes.Repeat([]byte{8}, 300000)
-	m, link, _ := corruptingFixture(t, data, 2) // needs macAttempts >= 3
-	var last int64
-	result, err := m.DownloadPublic(context.Background(), link, t.TempDir(), func(p Progress) {
-		if p.Transferred > int64(len(data)) {
-			t.Errorf("progress %d overshoots %d", p.Transferred, len(data))
-		}
-		last = p.Transferred
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	actual, err := os.ReadFile(result.Path)
-	if err != nil || !bytes.Equal(data, actual) {
-		t.Fatal("payload mismatch", err)
-	}
-	if last != int64(len(data)) {
-		t.Fatalf("final progress %d, want %d", last, len(data))
-	}
-}
-
 // A file whose MAC never verifies is kept and named, not failed: some
 // uploaders store a wrong MAC for intact data.
 func TestPersistentMACMismatchKeptUnverified(t *testing.T) {
-	m, link, gets := fileFixture(t, bytes.Repeat([]byte{7}, 200000), true)
+	m, link, _ := fileFixture(t, bytes.Repeat([]byte{7}, 200000), true)
 	result, err := m.DownloadPublic(context.Background(), link, t.TempDir(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -214,9 +180,6 @@ func TestPersistentMACMismatchKeptUnverified(t *testing.T) {
 	}
 	if info, err := os.Stat(result.Path); err != nil || info.Size() != 200000 {
 		t.Fatal("unverified file not kept whole", err)
-	}
-	if gets.Load() < macAttempts {
-		t.Fatalf("kept after %d downloads, want %d attempts first", gets.Load(), macAttempts)
 	}
 }
 

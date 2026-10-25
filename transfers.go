@@ -238,39 +238,10 @@ func (d *Download) downloadSpan(ctx context.Context, s chunkSpan, buf, scratch [
 	return last
 }
 
-// macAttempts is how many times one file is downloaded before a MAC mismatch
-// is final. A one-off bad read passes on a retry; a file whose stored MAC is
-// wrong fails every time, so a few attempts tell the two apart.
-const macAttempts = 3
-
-// downloadNode downloads node to destination, re-downloading it from scratch
-// after a MAC mismatch up to macAttempts times in all. Bytes reported for a
-// discarded attempt are taken back, so progress never overshoots the size.
-func (m *Mega) downloadNode(ctx context.Context, node *Node, d *Download, slots chan struct{}, destination string, onBytes func(int64)) error {
-	for attempt := 1; ; attempt++ {
-		var reported atomic.Int64
-		err := m.downloadNodeOnce(ctx, node, d, slots, destination, func(n int64) {
-			reported.Add(n)
-			if onBytes != nil {
-				onBytes(n)
-			}
-		})
-		if !errors.Is(err, EMACMISMATCH) || attempt == macAttempts || ctx.Err() != nil {
-			return err
-		}
-		if onBytes != nil {
-			onBytes(-reported.Load())
-		}
-		if err := os.Remove(destination); err != nil {
-			return err
-		}
-		d = nil // a fresh Download: new chunk MACs and a fresh URL
-	}
-}
-
-// downloadNodeOnce downloads node to destination. d may be pre-resolved (nil
+// downloadNode downloads node to destination. d may be pre-resolved (nil
 // means resolve now). slots, when set, bounds span GETs shared across files.
-func (m *Mega) downloadNodeOnce(ctx context.Context, node *Node, d *Download, slots chan struct{}, destination string, onBytes func(int64)) error {
+// EMACMISMATCH means every chunk was written; only the final MAC differed.
+func (m *Mega) downloadNode(ctx context.Context, node *Node, d *Download, slots chan struct{}, destination string, onBytes func(int64)) error {
 	var err error
 	if d == nil {
 		if d, err = m.NewDownloadContext(ctx, node); err != nil {
@@ -347,8 +318,8 @@ func publishDownload(source, destination string) error {
 
 // Download downloads a resolved resource into destination/name. Existing targets
 // are rejected. On failure, the private staging tree is removed, never published.
-// A file still failing MAC verification after macAttempts is complete, so it is
-// kept and listed in TransferResult.Unverified instead of failing the download.
+// A file failing MAC verification is complete, so it is kept and listed in
+// TransferResult.Unverified instead of failing the download.
 func (r *PublicResource) Download(ctx context.Context, destination string, progress ProgressFunc) (TransferResult, error) {
 	if err := ctx.Err(); err != nil {
 		return TransferResult{}, err
