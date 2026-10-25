@@ -59,7 +59,8 @@ func (p *progressReporter) add(count int64) {
 	}
 	speed := int64(0)
 	if elapsed := now.Sub(p.prev).Seconds(); elapsed > 0 {
-		speed = int64(float64(p.transferred-p.prevBytes) / elapsed)
+		// max: a retried file's bytes are taken back, dipping transferred
+		speed = max(0, int64(float64(p.transferred-p.prevBytes)/elapsed))
 	}
 	p.callback(Progress{p.name, p.transferred, p.total, speed})
 }
@@ -234,9 +235,39 @@ func (d *Download) downloadSpan(ctx context.Context, s chunkSpan, buf, scratch [
 	return last
 }
 
-// downloadNode downloads node to destination. d may be pre-resolved (nil means
-// resolve now). slots, when set, bounds span GETs shared across files.
+// macAttempts is how many times one file is downloaded before a MAC mismatch
+// is final. A one-off bad read passes on a retry; a file whose stored MAC is
+// wrong fails every time, so a few attempts tell the two apart.
+const macAttempts = 3
+
+// downloadNode downloads node to destination, re-downloading it from scratch
+// after a MAC mismatch up to macAttempts times in all. Bytes reported for a
+// discarded attempt are taken back, so progress never overshoots the size.
 func (m *Mega) downloadNode(ctx context.Context, node *Node, d *Download, slots chan struct{}, destination string, onBytes func(int64)) error {
+	for attempt := 1; ; attempt++ {
+		var reported atomic.Int64
+		err := m.downloadNodeOnce(ctx, node, d, slots, destination, func(n int64) {
+			reported.Add(n)
+			if onBytes != nil {
+				onBytes(n)
+			}
+		})
+		if !errors.Is(err, EMACMISMATCH) || attempt == macAttempts || ctx.Err() != nil {
+			return err
+		}
+		if onBytes != nil {
+			onBytes(-reported.Load())
+		}
+		if err := os.Remove(destination); err != nil {
+			return err
+		}
+		d = nil // a fresh Download: new chunk MACs and a fresh URL
+	}
+}
+
+// downloadNodeOnce downloads node to destination. d may be pre-resolved (nil
+// means resolve now). slots, when set, bounds span GETs shared across files.
+func (m *Mega) downloadNodeOnce(ctx context.Context, node *Node, d *Download, slots chan struct{}, destination string, onBytes func(int64)) error {
 	var err error
 	if d == nil {
 		if d, err = m.NewDownloadContext(ctx, node); err != nil {
@@ -368,7 +399,10 @@ func (r *PublicResource) Download(ctx context.Context, destination string, progr
 		resolved[id] = nil
 		resolveMu.Unlock()
 		i := files[id]
-		return m.downloadNode(ctx, r.nodes[i], d, slots, filepath.Join(staging, filepath.FromSlash(r.entries[i].Path)), reporter.add)
+		if err := m.downloadNode(ctx, r.nodes[i], d, slots, filepath.Join(staging, filepath.FromSlash(r.entries[i].Path)), reporter.add); err != nil {
+			return &FileError{Path: r.entries[i].Path, Err: err}
+		}
+		return nil
 	})
 	if err != nil {
 		return TransferResult{}, fmt.Errorf("MEGA download: %w", err)

@@ -110,7 +110,19 @@ func TestParsePublicLink(t *testing.T) {
 
 func fileFixture(t *testing.T, data []byte, corrupt bool) (*Mega, string, *atomic.Int32) {
 	t.Helper()
+	times := int32(0)
+	if corrupt {
+		times = -1
+	}
+	return corruptingFixture(t, data, times)
+}
+
+// corruptingFixture flips a bit in the first chunk of the first `times`
+// payload requests that start at offset 0; -1 corrupts every one.
+func corruptingFixture(t *testing.T, data []byte, times int32) (*Mega, string, *atomic.Int32) {
+	t.Helper()
 	key, ciphertext := fixtureFile(data)
+	var corrupted atomic.Int32
 	meta, _ := fileMeta(key)
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -125,7 +137,7 @@ func fileFixture(t *testing.T, data []byte, corrupt bool) (*Mega, string, *atomi
 		}
 		calls.Add(1)
 		out := append([]byte(nil), ciphertext[first:last+1]...)
-		if corrupt && first == 0 {
+		if first == 0 && (times < 0 || corrupted.Add(1) <= times) {
 			out[0] ^= 1
 		}
 		_, _ = w.Write(out)
@@ -165,11 +177,40 @@ func TestPublicDownloadIntegrity(t *testing.T) {
 	}
 }
 
+// A one-off bad read is re-downloaded instead of failing the task, and the
+// discarded attempt's bytes don't inflate progress.
+func TestTransientCorruptionRetried(t *testing.T) {
+	data := bytes.Repeat([]byte{8}, 300000)
+	m, link, _ := corruptingFixture(t, data, 2) // needs macAttempts >= 3
+	var last int64
+	result, err := m.DownloadPublic(context.Background(), link, t.TempDir(), func(p Progress) {
+		if p.Transferred > int64(len(data)) {
+			t.Errorf("progress %d overshoots %d", p.Transferred, len(data))
+		}
+		last = p.Transferred
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err := os.ReadFile(result.Path)
+	if err != nil || !bytes.Equal(data, actual) {
+		t.Fatal("payload mismatch", err)
+	}
+	if last != int64(len(data)) {
+		t.Fatalf("final progress %d, want %d", last, len(data))
+	}
+}
+
 func TestCorruptionNeverPublished(t *testing.T) {
 	m, link, _ := fileFixture(t, bytes.Repeat([]byte{7}, 200000), true)
 	dest := t.TempDir()
-	if _, err := m.DownloadPublic(context.Background(), link, dest, nil); !errors.Is(err, EMACMISMATCH) {
+	_, err := m.DownloadPublic(context.Background(), link, dest, nil)
+	if !errors.Is(err, EMACMISMATCH) {
 		t.Fatalf("got %v", err)
+	}
+	var fe *FileError
+	if !errors.As(err, &fe) || fe.Path != "video.bin" {
+		t.Fatalf("error does not name the file: %v", err)
 	}
 	entries, err := os.ReadDir(dest)
 	if err != nil || len(entries) != 0 {
