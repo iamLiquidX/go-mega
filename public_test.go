@@ -201,20 +201,22 @@ func TestTransientCorruptionRetried(t *testing.T) {
 	}
 }
 
-func TestCorruptionNeverPublished(t *testing.T) {
-	m, link, _ := fileFixture(t, bytes.Repeat([]byte{7}, 200000), true)
-	dest := t.TempDir()
-	_, err := m.DownloadPublic(context.Background(), link, dest, nil)
-	if !errors.Is(err, EMACMISMATCH) {
-		t.Fatalf("got %v", err)
+// A file whose MAC never verifies is kept and named, not failed: some
+// uploaders store a wrong MAC for intact data.
+func TestPersistentMACMismatchKeptUnverified(t *testing.T) {
+	m, link, gets := fileFixture(t, bytes.Repeat([]byte{7}, 200000), true)
+	result, err := m.DownloadPublic(context.Background(), link, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	var fe *FileError
-	if !errors.As(err, &fe) || fe.Path != "video.bin" {
-		t.Fatalf("error does not name the file: %v", err)
+	if len(result.Unverified) != 1 || result.Unverified[0] != "video.bin" {
+		t.Fatalf("unverified = %v", result.Unverified)
 	}
-	entries, err := os.ReadDir(dest)
-	if err != nil || len(entries) != 0 {
-		t.Fatal("failed download left visible files")
+	if info, err := os.Stat(result.Path); err != nil || info.Size() != 200000 {
+		t.Fatal("unverified file not kept whole", err)
+	}
+	if gets.Load() < macAttempts {
+		t.Fatalf("kept after %d downloads, want %d attempts first", gets.Load(), macAttempts)
 	}
 }
 

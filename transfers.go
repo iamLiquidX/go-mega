@@ -27,6 +27,9 @@ type TransferResult struct {
 	Name string
 	Path string
 	Size int64
+	// Unverified lists files, as entry paths, kept although every attempt
+	// failed MAC verification. Some uploaders store a wrong MAC for intact data.
+	Unverified []string
 }
 
 type progressReporter struct {
@@ -344,6 +347,8 @@ func publishDownload(source, destination string) error {
 
 // Download downloads a resolved resource into destination/name. Existing targets
 // are rejected. On failure, the private staging tree is removed, never published.
+// A file still failing MAC verification after macAttempts is complete, so it is
+// kept and listed in TransferResult.Unverified instead of failing the download.
 func (r *PublicResource) Download(ctx context.Context, destination string, progress ProgressFunc) (TransferResult, error) {
 	if err := ctx.Err(); err != nil {
 		return TransferResult{}, err
@@ -384,6 +389,7 @@ func (r *PublicResource) Download(ctx context.Context, destination string, progr
 	var resolveMu sync.Mutex
 	resolved := make([]*Download, len(files))
 	next := 0
+	var unverified []string
 	err = runChunks(ctx, len(files), parallelFiles, func(ctx context.Context, id int) error {
 		resolveMu.Lock()
 		for id >= next {
@@ -399,7 +405,14 @@ func (r *PublicResource) Download(ctx context.Context, destination string, progr
 		resolved[id] = nil
 		resolveMu.Unlock()
 		i := files[id]
-		if err := m.downloadNode(ctx, r.nodes[i], d, slots, filepath.Join(staging, filepath.FromSlash(r.entries[i].Path)), reporter.add); err != nil {
+		err := m.downloadNode(ctx, r.nodes[i], d, slots, filepath.Join(staging, filepath.FromSlash(r.entries[i].Path)), reporter.add)
+		if errors.Is(err, EMACMISMATCH) && ctx.Err() == nil {
+			resolveMu.Lock()
+			unverified = append(unverified, r.entries[i].Path)
+			resolveMu.Unlock()
+			return nil
+		}
+		if err != nil {
 			return &FileError{Path: r.entries[i].Path, Err: err}
 		}
 		return nil
@@ -418,7 +431,7 @@ func (r *PublicResource) Download(ctx context.Context, destination string, progr
 	if err = publishDownload(filepath.Join(staging, r.Name()), final); err != nil {
 		return TransferResult{}, err
 	}
-	return TransferResult{r.Name(), final, r.Size()}, nil
+	return TransferResult{r.Name(), final, r.Size(), unverified}, nil
 }
 
 // DownloadPublic resolves and downloads a public file or folder.

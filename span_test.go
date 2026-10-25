@@ -142,15 +142,19 @@ func TestSpanStallIsRetried(t *testing.T) {
 	}
 }
 
-func TestSpanCorruptionFailsMAC(t *testing.T) {
+func TestSpanCorruptionMarkedUnverified(t *testing.T) {
 	data := bytes.Repeat([]byte{9}, 2<<20)
 	api, key, _ := spanServer(t, data, func(_ int, w http.ResponseWriter, body []byte) {
 		bad := append([]byte(nil), body...)
 		bad[len(bad)/2] ^= 1
 		_, _ = w.Write(bad)
 	})
-	if _, err := spanDownload(t, api, key, nil); !errors.Is(err, EMACMISMATCH) {
-		t.Fatalf("err = %v", err)
+	m := New()
+	defer m.Close()
+	m.SetAPIUrl(api)
+	res, err := m.DownloadPublic(context.Background(), "https://mega.nz/file/"+fixtureHandle+"#"+base64urlencode(key), t.TempDir(), nil)
+	if err != nil || len(res.Unverified) != 1 {
+		t.Fatalf("err = %v, unverified = %v", err, res.Unverified)
 	}
 }
 
